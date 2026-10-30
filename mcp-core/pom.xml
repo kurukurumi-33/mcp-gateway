@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.kurukurumi33</groupId>
+    <artifactId>mcp-gateway</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>mcp-core</artifactId>
+  <name>mcp-core</name>
+  <description>
+    Framework-agnostic core: the MCP 2026-07-28 protocol engine, the BackendAdapter SPI
+    and the tool registry. No Spring, no transport — only Jackson.
+  </description>
+
+  <dependencies>
+    <dependency>
+      <groupId>tools.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <properties>
+    <!-- Override with -Ddemo.mainClass=… to run the client walkthrough instead of the server. -->
+    <demo.mainClass>io.github.kurukurumi33.mcp.devtools.DevServerMain</demo.mainClass>
+  </properties>
+
+  <build>
+    <plugins>
+      <!-- mvn -pl mcp-core exec:java 直接起无状态 MCP server（演示用） -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <mainClass>${demo.mainClass}</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

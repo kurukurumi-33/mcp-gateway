@@ -1,0 +1,103 @@
+@host = http://127.0.0.1:8931
+
+### 块1 健康与后端清单（浏览器直接打开也行）
+GET {{host}}/actuator/health
+
+### 块2 tools/list
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/list
+
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块3 裸 SELECT（全链路 happy path）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT customer, amount FROM orders ORDER BY amount DESC"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块4 limit 与截断
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT * FROM orders ORDER BY id","limit":2},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块5 DELETE 被拒（期望 HTTP 200 + isError:true）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"DELETE FROM orders"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块5b 确认表没被删（期望 count = 4）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT count(*) FROM orders"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块6 多语句被拒（期望 "Only one statement per call is allowed"）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT 1; DROP TABLE orders"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块7 真 SQL 错误（期望 HTTP 200 + isError + "SQL error:"）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT * FROM no_such_table"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块8 WITH 白名单（不该被误杀，期望 n = 4）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"WITH t AS (SELECT count(*) AS n FROM orders) SELECT n FROM t"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块9 字面量里的关键字（不该被误杀，期望正常返回文本）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT 'drop table orders' AS warning"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块10 头不匹配（期望 HTTP 400 + error.code -32020）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/list
+Mcp-Name: analytics_run_sql
+
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT 1"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块11 SSE 流式（这个在 REST Client 里看不出"边跑边到"，建议改用 curl.exe -N）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: compute_slow_sum
+Accept: text/event-stream
+
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"compute_slow_sum","arguments":{"n":8},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"p1","io.modelcontextprotocol/logLevel":"info"}}}

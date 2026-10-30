@@ -1,0 +1,41 @@
+server:
+  port: 8931
+
+mcp:
+  gateway:
+    # Must stay the same across restarts, or in-flight multi-round calls become unresumable.
+    # With no value a random key is generated and a warning is logged.
+    request-state-secret: ${MCP_REQUEST_STATE_SECRET:}
+    server-name: mcp-gateway-app
+    server-version: 0.1.0
+    cache-ttl-ms: 60000
+    streaming-enabled: true
+
+    # Leave endpoint empty to run with the in-memory demo adapter instead.
+    # Works with any S3 implementation: SeaweedFS, MinIO, Ceph, OSS, AWS.
+    s3:
+      endpoint: ${MCP_S3_ENDPOINT:}
+      region: ${MCP_S3_REGION:us-east-1}
+      access-key: ${MCP_S3_ACCESS_KEY:}
+      secret-key: ${MCP_S3_SECRET_KEY:}
+      bucket: ${MCP_S3_BUCKET:mcp-demo}
+
+    # Read-only SQL backend. jdbc:duckdb: is in-memory and is seeded with sample tables at startup.
+    # Point at jdbc:duckdb:D:/data/analytics.duckdb to persist; the seed is then skipped.
+    duckdb:
+      url: ${MCP_DUCKDB_URL:jdbc:duckdb:}
+      max-rows: 200
+      timeout-seconds: 5
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    io.github.kurukurumi33.mcp: INFO

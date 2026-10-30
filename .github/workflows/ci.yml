@@ -1,0 +1,70 @@
+name: CI
+
+# The suite is the contract: every push runs the protocol, transport and backend tests.
+# Integration tests that need an external service (S3) skip themselves when the endpoint is
+# absent, so this workflow stays green on a machine with no storage.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 21 is the release target in the pom, not the local JDK. Building with it keeps
+      # "works on my machine" from hiding a use of a newer API.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Verify
+        run: mvn -B -ntp verify
+
+      # The three S3 integration tests skip themselves unless MCP_S3_ENDPOINT is set, which is why
+      # mcp-backends reports lower coverage here than locally. To run them on the runner, add a
+      # MinIO service container and pass the endpoint:
+      #
+      #   services:
+      #     minio:
+      #       image: minio/minio
+      #       env: { MINIO_ROOT_USER: mcpaccess, MINIO_ROOT_PASSWORD: mcpsecretmcpsecret }
+      #       ports: [ '9000:9000' ]
+      #       options: >-
+      #         --health-cmd "mc ready local" --health-interval 5s --health-retries 10
+      #
+      # plus `env: { MCP_S3_ENDPOINT: http://127.0.0.1:9000 }` on the step above. Left out until
+      # someone has watched it pass on a runner: the healthcheck command differs between images
+      # and there is no local Docker here to try it against.
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/*'
+          if-no-files-found: ignore
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: '**/target/site/jacoco/'
+          if-no-files-found: ignore
