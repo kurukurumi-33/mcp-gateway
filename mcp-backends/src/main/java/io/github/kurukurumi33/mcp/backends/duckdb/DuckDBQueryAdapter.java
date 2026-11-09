@@ -13,6 +13,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -33,6 +34,12 @@ import java.util.regex.Pattern;
  * <p>The point of this adapter is that a model can look at data, not just at objects. It stays
  * deliberately narrow: one statement per call, reads only, a hard row cap and a query timeout. The
  * gateway still owns everything protocol-shaped; this class only knows JDBC.
+ *
+ * <p>Three tools, in the order a model should use them: {@code list_tables} and
+ * {@code describe_table} read {@code information_schema}, then {@code run_sql} runs the query the
+ * model was able to write because it looked first. The catalog lives here rather than in its own
+ * backend because an in-memory DuckDB database exists only on its connection: a second adapter
+ * would have to share it, which would report one resource as two backends that fail together.
  *
  * <p>Three safety layers, because a single one is easy to get wrong:
  * <ol>
@@ -111,7 +118,25 @@ public final class DuckDBQueryAdapter implements BackendAdapter, AutoCloseable {
 
     @Override
     public List<ToolDefinition> tools() {
-        ObjectNode schema = Json.obj()
+        ObjectNode listTablesSchema = Json.obj()
+                .put("type", "object")
+                .set("properties", Json.obj()
+                        .set("schema", Json.obj()
+                                .put("type", "string")
+                                .put("description", "Schema to list. Defaults to 'main'.")));
+
+        ObjectNode describeTableSchema = Json.obj()
+                .put("type", "object")
+                .set("properties", Json.obj()
+                        .set("table", Json.obj()
+                                .put("type", "string")
+                                .put("description", "Table name, exactly as list_tables returned it."))
+                        .set("schema", Json.obj()
+                                .put("type", "string")
+                                .put("description", "Schema the table lives in. Defaults to 'main'.")))
+                .set("required", Json.arr().add("table"));
+
+        ObjectNode runSqlSchema = Json.obj()
                 .put("type", "object")
                 .set("properties", Json.obj()
                         .set("sql", Json.obj()
@@ -122,18 +147,30 @@ public final class DuckDBQueryAdapter implements BackendAdapter, AutoCloseable {
                                 .put("description", "Maximum rows to return, capped at " + maxRows + ".")))
                 .set("required", Json.arr().add("sql"));
 
-        return List.of(ToolDefinition.of(
-                "run_sql",
-                "Runs one read-only SQL query and returns columns plus rows. "
-                        + "Use it to inspect data that already exists; writes are rejected.",
-                schema));
+        return List.of(
+                ToolDefinition.of("list_tables",
+                        "Lists the tables and views in a schema. Call this first: it is the only way "
+                                + "to learn what data exists before writing SQL.", listTablesSchema),
+                ToolDefinition.of("describe_table",
+                        "Returns the columns of one table with their types, nullability and defaults. "
+                                + "Use it when the query depends on exact column names.", describeTableSchema),
+                ToolDefinition.of("run_sql",
+                        "Runs one read-only SQL query and returns columns plus rows. "
+                                + "Use it to inspect data that already exists; writes are rejected.",
+                        runSqlSchema));
     }
 
     @Override
     public ToolResult execute(String toolName, RequestContext context) {
-        if (!"run_sql".equals(toolName)) {
-            return ToolResult.error("Unknown tool '" + toolName + "'");
-        }
+        return switch (toolName) {
+            case "run_sql" -> runSql(context);
+            case "list_tables" -> listTables(context);
+            case "describe_table" -> describeTable(context);
+            default -> ToolResult.error("Unknown tool '" + toolName + "'");
+        };
+    }
+
+    private ToolResult runSql(RequestContext context) {
 
         String sql = context.stringArg("sql");
         if (sql == null || sql.isBlank()) {
@@ -156,6 +193,103 @@ public final class DuckDBQueryAdapter implements BackendAdapter, AutoCloseable {
         } catch (RuntimeException e) {
             return ToolResult.error("Query failed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Lists what exists. Both catalog tools pass the argument as a bound parameter rather than
+     * pasting it into the statement, so a schema or table name is always data: there is no string
+     * in this class that a caller can close and escape from.
+     */
+    private ToolResult listTables(RequestContext context) {
+        String schema = schemaArg(context);
+        try {
+            return withConnection(connection -> {
+                ArrayNode tables = Json.arr();
+                String sql = "SELECT table_schema, table_name, table_type"
+                        + " FROM information_schema.tables"
+                        + " WHERE lower(table_schema) = lower(?)"
+                        + " ORDER BY table_name LIMIT " + maxRows;
+                try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                    statement.setString(1, schema);
+                    try (ResultSet rs = statement.executeQuery()) {
+                        while (rs.next()) {
+                            tables.add(Json.obj()
+                                    .put("schema", rs.getString("table_schema"))
+                                    .put("name", rs.getString("table_name"))
+                                    .put("type", rs.getString("table_type")));
+                        }
+                    }
+                }
+
+                ObjectNode structured = Json.obj()
+                        .put("schema", schema)
+                        .set("tables", tables)
+                        .put("count", tables.size());
+                return ToolResult.of(tables.size() + " table(s) in schema '" + schema + "'", structured);
+            });
+        } catch (SQLException e) {
+            return ToolResult.error("Catalog error: " + e.getMessage());
+        } catch (RuntimeException e) {
+            return ToolResult.error("Catalog failed: " + e.getMessage());
+        }
+    }
+
+    /** Describes one table. A name that matches nothing is a failed call with a next step in it. */
+    private ToolResult describeTable(RequestContext context) {
+        String table = context.stringArg("table");
+        if (table == null || table.isBlank()) {
+            return ToolResult.error("table is required");
+        }
+        String schema = schemaArg(context);
+        try {
+            return withConnection(connection -> {
+                ArrayNode columns = Json.arr();
+                String sql = "SELECT column_name, data_type, is_nullable, column_default"
+                        + " FROM information_schema.columns"
+                        + " WHERE lower(table_schema) = lower(?) AND lower(table_name) = lower(?)"
+                        + " ORDER BY ordinal_position";
+                try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                    statement.setString(1, schema);
+                    statement.setString(2, table.trim());
+                    try (ResultSet rs = statement.executeQuery()) {
+                        while (rs.next()) {
+                            ObjectNode column = Json.obj()
+                                    .put("name", rs.getString("column_name"))
+                                    .put("type", rs.getString("data_type"))
+                                    .put("nullable", "YES".equalsIgnoreCase(rs.getString("is_nullable")));
+                            String defaultValue = rs.getString("column_default");
+                            if (defaultValue != null) {
+                                column.put("default", defaultValue);
+                            }
+                            columns.add(column);
+                        }
+                    }
+                }
+
+                if (columns.isEmpty()) {
+                    // Naming the next tool is cheaper than letting the model guess at a table that
+                    // does not exist and read a driver error instead.
+                    return ToolResult.error("Table '" + table + "' not found in schema '" + schema
+                            + "'. Call list_tables to see what exists.");
+                }
+
+                ObjectNode structured = Json.obj()
+                        .put("schema", schema)
+                        .put("table", table.trim())
+                        .set("columns", columns)
+                        .put("columnCount", columns.size());
+                return ToolResult.of(columns.size() + " column(s) in '" + table.trim() + "'", structured);
+            });
+        } catch (SQLException e) {
+            return ToolResult.error("Catalog error: " + e.getMessage());
+        } catch (RuntimeException e) {
+            return ToolResult.error("Catalog failed: " + e.getMessage());
+        }
+    }
+
+    private static String schemaArg(RequestContext context) {
+        String schema = context.stringArg("schema");
+        return schema == null || schema.isBlank() ? "main" : schema.trim();
     }
 
     @Override

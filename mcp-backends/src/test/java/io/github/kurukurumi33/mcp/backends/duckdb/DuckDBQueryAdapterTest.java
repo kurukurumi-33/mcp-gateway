@@ -3,6 +3,7 @@ package io.github.kurukurumi33.mcp.backends.duckdb;
 import io.github.kurukurumi33.mcp.protocol.Json;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
 import io.github.kurukurumi33.mcp.spi.StreamEmitter;
+import io.github.kurukurumi33.mcp.spi.ToolDefinition;
 import io.github.kurukurumi33.mcp.spi.ToolResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,6 +11,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -43,8 +45,71 @@ class DuckDBQueryAdapterTest {
     @DisplayName("tools() describes the catalog without opening a database")
     void catalogNeedsNoConnection() {
         var offline = new DuckDBQueryAdapter("analytics", "jdbc:duckdb:C:/no/such/directory/x.duckdb");
-        assertEquals(1, offline.tools().size());
-        assertEquals("run_sql", offline.tools().get(0).name());
+        assertEquals(3, offline.tools().size());
+        assertEquals(List.of("list_tables", "describe_table", "run_sql"),
+                offline.tools().stream().map(ToolDefinition::name).toList());
+    }
+
+    @Test
+    @DisplayName("list_tables finds the tables in main and nothing from information_schema")
+    void listTablesFindsUserTables() {
+        ToolResult result = adapter.execute("list_tables", context(Json.obj()));
+
+        JsonNode data = structured(result);
+        List<String> names = new ArrayList<>();
+        data.path("tables").forEach(table -> names.add(table.path("name").asString()));
+        assertEquals(List.of("orders"), names);
+        assertEquals("main", data.path("schema").asString());
+        assertEquals(1, data.path("count").asInt());
+    }
+
+    @Test
+    @DisplayName("list_tables reports an empty schema as an empty list, not an error")
+    void listTablesOnUnknownSchemaIsEmpty() {
+        ToolResult result = adapter.execute("list_tables", context(Json.obj().put("schema", "nope")));
+
+        assertFalse(result.isError());
+        assertEquals(0, structured(result).path("count").asInt());
+    }
+
+    @Test
+    @DisplayName("describe_table returns the seeded columns in order")
+    void describeTableReturnsColumns() {
+        ToolResult result = adapter.execute("describe_table",
+                context(Json.obj().put("table", "orders")));
+
+        JsonNode data = structured(result);
+        assertEquals(3, data.path("columnCount").asInt());
+        assertEquals("id", data.path("columns").get(0).path("name").asString());
+        assertEquals("INTEGER", data.path("columns").get(0).path("type").asString());
+        assertEquals("customer", data.path("columns").get(1).path("name").asString());
+        // Declared without NOT NULL, so the catalog must say so.
+        assertTrue(data.path("columns").get(1).path("nullable").asBoolean());
+    }
+
+    @Test
+    @DisplayName("describe_table on a missing table points at list_tables")
+    void describeMissingTableFails() {
+        ToolResult result = adapter.execute("describe_table",
+                context(Json.obj().put("table", "no_such_table")));
+
+        assertTrue(result.isError());
+        String message = result.content().get(0).path("text").asString();
+        assertTrue(message.contains("not found"), message);
+        assertTrue(message.contains("list_tables"), message);
+    }
+
+    @Test
+    @DisplayName("a table name is bound, not interpolated, so it cannot carry a second statement")
+    void tableNameIsNeverInterpolated() {
+        ToolResult result = adapter.execute("describe_table",
+                context(Json.obj().put("table", "orders'; DROP TABLE orders; --")));
+
+        assertTrue(result.isError());
+        // The point of the test: the table is still there afterwards.
+        ToolResult after = adapter.execute("run_sql",
+                context(Json.obj().put("sql", "SELECT count(*) FROM orders")));
+        assertEquals(3, structured(after).path("rows").get(0).get(0).asInt());
     }
 
     @Test
