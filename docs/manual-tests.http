@@ -101,3 +101,107 @@ Mcp-Name: compute_slow_sum
 Accept: text/event-stream
 
 {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"compute_slow_sum","arguments":{"n":8},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"p1","io.modelcontextprotocol/logLevel":"info"}}}
+
+### 块12 analytics_list_tables（目录层，期望 events + orders 两张表）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_list_tables
+
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"analytics_list_tables","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块13 analytics_describe_table（目录层，期望 orders 的 4 列和类型）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_describe_table
+
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"analytics_describe_table","arguments":{"table":"orders"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块14 不存在的表（期望 isError，且提示先调 list_tables）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_describe_table
+
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"analytics_describe_table","arguments":{"table":"no_such_table"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块15 目录工具的参数是绑定的（期望 isError，且 orders 表还在）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: analytics_describe_table
+
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"analytics_describe_table","arguments":{"table":"orders'; DROP TABLE orders; --"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+### 块16 resources/list（期望 mcp://system/gateway/about.md 和两条 mcp://storage/...）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: resources/list
+
+{"jsonrpc":"2.0","id":16,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块17 resources/templates/list（期望 mcp://storage/{+key}）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: resources/templates/list
+
+{"jsonrpc":"2.0","id":17,"method":"resources/templates/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块18 读文本资源（期望 contents[0].text 含 "event":"login"，没有 blob）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: resources/read
+Mcp-Name: mcp://storage/raw/events-0001.jsonl
+
+{"jsonrpc":"2.0","id":18,"method":"resources/read","params":{"uri":"mcp://storage/raw/events-0001.jsonl","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块19 读二进制资源（期望 contents[0].blob 是 base64，没有 text）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: resources/read
+Mcp-Name: mcp://storage/reports/2026-q3.parquet
+
+{"jsonrpc":"2.0","id":19,"method":"resources/read","params":{"uri":"mcp://storage/reports/2026-q3.parquet","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块20 读不存在的资源（期望 HTTP 400、-32602、error.data.uri 回显请求的 uri）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: resources/read
+Mcp-Name: mcp://storage/nope.txt
+
+{"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"mcp://storage/nope.txt","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块21 prompts/list（期望 system_explain_backend，arguments[0].required = true）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: prompts/list
+
+{"jsonrpc":"2.0","id":21,"method":"prompts/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块22 prompts/get（期望 messages[0].role = user）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: prompts/get
+Mcp-Name: system_explain_backend
+
+{"jsonrpc":"2.0","id":22,"method":"prompts/get","params":{"name":"system_explain_backend","arguments":{"namespace":"storage"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+
+### 块23 缺必填参数的 prompt（期望 HTTP 400、-32602）
+POST {{host}}/mcp
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: prompts/get
+Mcp-Name: system_explain_backend
+
+{"jsonrpc":"2.0","id":23,"method":"prompts/get","params":{"name":"system_explain_backend","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}

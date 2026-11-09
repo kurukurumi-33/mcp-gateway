@@ -1,6 +1,6 @@
 package io.github.kurukurumi33.mcp.spring;
 
-import io.github.kurukurumi33.mcp.registry.ToolRegistry;
+import io.github.kurukurumi33.mcp.registry.GatewayRegistry;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
 import io.github.kurukurumi33.mcp.spi.HealthStatus;
 import org.springframework.boot.health.contributor.Health;
@@ -22,9 +22,9 @@ import java.util.Map;
  */
 public class McpBackendHealthIndicator implements HealthIndicator {
 
-    private final ToolRegistry registry;
+    private final GatewayRegistry registry;
 
-    public McpBackendHealthIndicator(ToolRegistry registry) {
+    public McpBackendHealthIndicator(GatewayRegistry registry) {
         this.registry = registry;
     }
 
@@ -44,7 +44,9 @@ public class McpBackendHealthIndicator implements HealthIndicator {
 
         Health.Builder builder = anyCallable ? Health.up() : Health.down();
         return builder
-                .withDetail("tools", registry.size())
+                .withDetail("tools", registry.toolCount())
+                .withDetail("resources", registry.resources().size())
+                .withDetail("prompts", registry.prompts().size())
                 .withDetail("backends", backends)
                 .build();
     }

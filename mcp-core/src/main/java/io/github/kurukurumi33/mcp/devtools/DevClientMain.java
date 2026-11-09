@@ -5,7 +5,7 @@ import io.github.kurukurumi33.mcp.demo.StorageAdapter;
 import io.github.kurukurumi33.mcp.demo.SystemAdapter;
 import io.github.kurukurumi33.mcp.protocol.Json;
 import io.github.kurukurumi33.mcp.protocol.McpProtocol;
-import io.github.kurukurumi33.mcp.registry.ToolRegistry;
+import io.github.kurukurumi33.mcp.registry.GatewayRegistry;
 import io.github.kurukurumi33.mcp.server.McpServerEngine;
 import io.github.kurukurumi33.mcp.server.RequestStateCodec;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
@@ -45,7 +45,7 @@ public final class DevClientMain {
                 new StorageAdapter(),
                 new ComputeAdapter());
 
-        ToolRegistry registry = new ToolRegistry(adapters);
+        GatewayRegistry registry = new GatewayRegistry(adapters);
         McpServerEngine engine = new McpServerEngine(
                 registry,
                 new RequestStateCodec("demo-only-signing-key-0123456789".getBytes(StandardCharsets.UTF_8)),
@@ -60,6 +60,7 @@ public final class DevClientMain {
             normalCall(endpoint);
             multiRoundTrip(endpoint);
             streaming(endpoint);
+            resourcesAndPrompts(endpoint);
             errorCases(endpoint);
 
             System.out.println();
@@ -70,11 +71,11 @@ public final class DevClientMain {
 
     // ------------------------------------------------------------------ scenarios
 
-    private static void banner(String endpoint, ToolRegistry registry) {
+    private static void banner(String endpoint, GatewayRegistry registry) {
         System.out.println("=".repeat(74));
         System.out.println(" MCP 2026-07-28 stateless protocol - end-to-end walkthrough");
         System.out.println(" server : " + endpoint);
-        System.out.println(" backends: " + registry.adapters().size() + "   tools: " + registry.size());
+        System.out.println(" backends: " + registry.adapters().size() + "   tools: " + registry.toolCount());
         System.out.println("=".repeat(74));
     }
 
@@ -180,8 +181,57 @@ public final class DevClientMain {
         System.out.println("   (the protocol forbids log notifications the client did not ask for)");
     }
 
+    private static void resourcesAndPrompts(String endpoint) throws Exception {
+        section(6, "resources", "one flat mcp:// catalog; the backend decides text or blob");
+
+        JsonNode list = result(post(endpoint, "resources/list", null, null, params(null)));
+        for (JsonNode resource : list.path("resources")) {
+            System.out.printf("     - %-42s %s%n", resource.path("uri").asString(),
+                    resource.path("mimeType").asString(""));
+        }
+
+        JsonNode templates = result(post(endpoint, "resources/templates/list", null, null, params(null)));
+        System.out.println("   templates: " + Json.write(templates.path("resourceTemplates")));
+
+        ObjectNode textParams = params(null);
+        textParams.put("uri", "mcp://storage/raw/events-0001.jsonl");
+        JsonNode textEntry = result(post(endpoint, "resources/read",
+                "mcp://storage/raw/events-0001.jsonl", null, textParams)).path("contents").get(0);
+        System.out.println("   text     : " + textEntry.path("text").asString().trim());
+
+        ObjectNode blobParams = params(null);
+        blobParams.put("uri", "mcp://storage/reports/2026-q3.parquet");
+        JsonNode blobEntry = result(post(endpoint, "resources/read",
+                "mcp://storage/reports/2026-q3.parquet", null, blobParams)).path("contents").get(0);
+        System.out.println("   blob     : " + blobEntry.path("blob").asString()
+                + " (base64, " + blobEntry.path("mimeType").asString() + ")");
+
+        ObjectNode missing = params(null);
+        missing.put("uri", "mcp://storage/nope.txt");
+        report("client reads a uri that does not exist (expect -32602 with data.uri)",
+                post(endpoint, "resources/read", "mcp://storage/nope.txt", null, missing));
+
+        section(7, "prompts", "namespaced names, required arguments validated before the adapter runs");
+
+        JsonNode prompt = result(post(endpoint, "prompts/list", null, null, params(null)))
+                .path("prompts").get(0);
+        System.out.println("   published: " + Json.write(prompt));
+
+        ObjectNode get = params("system_explain_backend");
+        get.set("arguments", Json.obj().put("namespace", "storage"));
+        JsonNode message = result(post(endpoint, "prompts/get",
+                "system_explain_backend", null, get)).path("messages").get(0);
+        System.out.println("   rendered : [" + message.path("role").asString() + "] "
+                + message.path("content").path("text").asString());
+
+        ObjectNode noArgs = params("system_explain_backend");
+        noArgs.set("arguments", Json.obj());
+        report("client omits the required 'namespace' argument (expect -32602)",
+                post(endpoint, "prompts/get", "system_explain_backend", null, noArgs));
+    }
+
     private static void errorCases(String endpoint) throws Exception {
-        section(6, "rejections", "what the transport layer is required to refuse");
+        section(8, "rejections", "what the transport layer is required to refuse");
 
         // Mcp-Name header contradicting the body
         ObjectNode p = params("system_ping");

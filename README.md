@@ -40,6 +40,8 @@ way: it adapts plain backends directly, with no MCP server in between.
 | Multi-round requests: server returns `input_required` + `inputRequests`, client replays with `inputResponses` | implemented |
 | Error codes `-32020` / `-32021` / `-32022` | implemented |
 | Cacheable results (`ttlMs`, `cacheScope`) | implemented |
+| Resources: `resources/list`, `resources/templates/list`, `resources/read` | implemented |
+| Prompts: `prompts/list`, `prompts/get` | implemented |
 | Progress and log notifications on the request's own stream; logging only when the client opts in | implemented |
 | `subscriptions/listen`, tasks extension, OAuth, stdio transport | not implemented |
 
@@ -60,8 +62,9 @@ mvn -pl mcp-core exec:java
 ```
 
 The walkthrough covers discovery, the namespaced catalog, a plain call, a two-round request, streaming
-notifications and the four rejections the revision requires. It boots a server on an ephemeral port in
-the same process but talks to it over real HTTP, so what it prints is what a client would see.
+notifications, resources and prompts, and the four rejections the revision requires. It boots a server
+on an ephemeral port in the same process but talks to it over real HTTP, so what it prints is what a
+client would see.
 
 Talking to either server by hand:
 
@@ -81,20 +84,20 @@ SSE; without it you get a single JSON body.
 
 ## Testing
 
-`mvn verify` runs 38 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
+`mvn verify` runs 59 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
 the same command on every push against JDK 21, which is the release target rather than the local JDK.
 
 | Module | Line coverage | What the tests are for |
 |---|---|---|
-| `mcp-core` | 87% | protocol constants, the engine's header and `_meta` validation, MRTR round trips, `requestState` signing, the registry |
-| `mcp-backends` | 60% | S3 adapter (unit) and DuckDB guard, truncation and error shaping |
-| `mcp-spring-boot-starter` | 74% | the HTTP endpoint over a real port: status codes, SSE switch, actuator aggregation |
+| `mcp-core` | 86% | protocol constants, the engine's header and `_meta` validation, MRTR round trips, `requestState` signing, the three catalogs |
+| `mcp-backends` | 62% | S3 adapter (unit), DuckDB guard, truncation, catalog and error shaping |
+| `mcp-spring-boot-starter` | 75% | the HTTP endpoint over a real port: status codes, SSE switch, actuator aggregation |
 
 Two exclusions are deliberate. `mcp-core` skips `devtools/` and `conformance/` in the report: the dev
 server is a harness no test drives, and the conformance fixtures exist to be called over the wire by
 the official suite, so counting them would measure code nothing here executes. `mcp-backends` sits
-lower because its three S3 integration tests skip without an endpoint; that is the gap between 60%
-here and what the same module reports with storage running.
+lower because both the three S3 integration tests and the S3 `readResource` path need a live bucket;
+that is the gap between 62% here and what the same module reports with storage running.
 
 What the tests cannot reach is the reason `docs/manual-tests.http` exists: an HTTP status code that
 disagrees with the JSON-RPC body, a `Content-Type` that should have switched to `text/event-stream`,
@@ -127,12 +130,59 @@ Current result: **79 passed, 9 failed** across the draft server scenarios.
 | `http-custom-header-server-validation` | 1 / 6 |
 | `input-required-result-non-tool-request` | 1 / 2 |
 
-The remaining failures are missing features rather than protocol errors: `prompts/*` and
-`resources/*` are not implemented, so neither the caching hints on those lists nor `prompts/get` can
-be exercised, and the `x-mcp-header` extension is not implemented at all.
+Those figures predate the resources and prompts wiring. The scenarios that were failing for missing
+features — the caching hints on `resources/list` and `prompts/list`, `resources/read`, and the
+prompt-based input-required case — are now reachable; the numbers need a rerun before they are quoted
+again. The one known gap that remains is the `x-mcp-header` extension.
 
 The `test_*` fixtures the suite drives live in `mcp-core/.../conformance/` and are registered only
 when `mcp.gateway.conformance-fixtures` is true.
+
+## Resources and prompts
+
+Resources and prompts are part of the same SPI, as default methods, so a backend that has neither
+implements nothing extra.
+
+| Method | What the engine does |
+|---|---|
+| `resources/list` | flattens every adapter's resources into one list of `mcp://<namespace>/<path>` uris |
+| `resources/templates/list` | the same for RFC 6570 templates |
+| `resources/read` | splits the uri, routes to the owning adapter, shapes text or blob contents |
+| `prompts/list` | publishes prompt names prefixed with the namespace, arguments included |
+| `prompts/get` | validates required arguments, then routes to the adapter to render messages |
+
+Four decisions are visible in the wire format:
+
+- **Adapters declare backend-local paths, never uris.** An adapter says `reports/q3.parquet`; the
+  gateway publishes `mcp://storage/reports/q3.parquet`. Two backends can both hold a
+  `reports/q3.parquet`, and swapping the storage implementation does not invalidate uris clients
+  already cached. Routing then needs no index lookup: the first path segment is the namespace.
+- **Text or blob is the adapter's call.** `ResourceContent` requires exactly one of `text` and `blob`,
+  and the factory that produced it decides. Guessing from the mime type in the engine would misfile
+  every object uploaded by hand as `application/octet-stream`.
+- **A missing resource is a JSON-RPC error, not a tool error.** The answer is `-32602` with
+  `error.data.uri`, never a `200` with `contents: []`, because a client renders an empty array as an
+  empty file.
+- **Prompt arguments are validated in the engine.** Required arguments are declared in
+  `PromptDefinition`, so omitting one is rejected with `-32602` before the adapter runs.
+
+```java
+@Override public List<ResourceDefinition> resources() {
+    return List.of(ResourceDefinition.of("reports/q3.parquet", "Q3 report",
+            "application/vnd.apache.parquet"));
+}
+
+@Override public List<ResourceTemplate> resourceTemplates() {
+    return List.of(ResourceTemplate.of("{+key}", "any object by key", null));
+}
+
+@Override public Optional<ResourceContent> readResource(String uri) {
+    byte[] bytes = fetch(uri);
+    return Optional.of(isProbablyText(bytes)
+            ? ResourceContent.text(uri, "text/plain", new String(bytes, UTF_8))
+            : ResourceContent.binary(uri, "application/octet-stream", bytes));
+}
+```
 
 ## Object storage
 
@@ -156,8 +206,19 @@ MCP_S3_ENDPOINT=http://127.0.0.1:8333 mvn -pl mcp-backends -am test
 
 ## SQL backend
 
-`DuckDBQueryAdapter` exposes one read-only tool, `analytics_run_sql`. It is the backend that lets a
-model look at data rather than at object keys; the catalog and query layers build on it.
+`DuckDBQueryAdapter` is the backend that lets a model look at data rather than at object keys. It
+exposes three tools, in the order a model is meant to use them:
+
+| Tool | Purpose |
+|---|---|
+| `analytics_list_tables` | lists the tables and views in a schema, `main` by default |
+| `analytics_describe_table` | columns, types, nullability and defaults for one table |
+| `analytics_run_sql` | one read-only statement, returns columns plus rows |
+
+The catalog is part of this backend rather than a separate one because an in-memory DuckDB database
+exists only on its connection. A second adapter would have to share that connection, which turns one
+resource into two backends that go down together. Same namespace also means a model sees
+`analytics_list_tables` and `analytics_run_sql` next to each other and knows they read the same data.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8931/mcp \
@@ -168,7 +229,11 @@ curl -s -X POST http://127.0.0.1:8931/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"analytics_run_sql","arguments":{"sql":"SELECT customer, amount FROM orders ORDER BY amount DESC"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
-The guard has three layers, because one is easy to bypass:
+The catalog tools bind their arguments as JDBC parameters instead of building the statement from
+them, so a table name is always data. `describe_table` on a name that does not exist is a failed
+call that tells the model to run `list_tables` first, rather than a driver error it has to decode.
+
+`run_sql`'s guard has three layers, because one is easy to bypass:
 
 - the statement must start with a read-only keyword, checked **after** string literals and comments
   are stripped, so `SELECT 'drop table x'` is not mistaken for a write;
@@ -247,15 +312,19 @@ Two rules keep the catalog trustworthy:
 - `health()` is how reachability is reported. A backend that is down keeps its tools listed but marks
   them unavailable, so an agent can see that a capability exists rather than losing it silently.
 
+`resources()`, `resourceTemplates()`, `readResource()`, `prompts()` and `getPrompt()` are default
+methods, so a backend with no resources or prompts never mentions them. Overriding one is enough;
+nothing else in the engine or registry changes.
+
 ## Layout
 
 ```
 mcp-gateway/
-├── mcp-core/                  protocol engine, BackendAdapter SPI, tool registry, dev transport
+├── mcp-core/                  protocol engine, BackendAdapter SPI, catalog, dev transport
 │   └── src/main/java/io/github/kurukurumi33/mcp/
 │       ├── protocol/          wire constants, JSON-RPC envelope, error codes
-│       ├── spi/               BackendAdapter, ToolDefinition, ToolResult, RequestContext
-│       ├── registry/          namespaced catalog with collision detection
+│       ├── spi/               BackendAdapter, tools, resources, prompts, RequestContext
+│       ├── registry/          namespaced catalogs with collision detection, mcp:// routing
 │       ├── server/            McpServerEngine, RequestStateCodec
 │       ├── devtools/          JDK-HttpServer transport + main
 │       ├── conformance/       diagnostic fixtures for the official test suite
@@ -266,7 +335,7 @@ mcp-gateway/
 ```
 
 `mcp-core` has no Spring dependency, so the engine and SPI work in any Java runtime. The starter is one
-thin binding; the next adapters are the catalog layer over `information_schema` and a Spark backend.
+thin binding; the next adapter behind the same SPI is a Spark backend.
 
 ## Notes on two deliberate choices
 
@@ -284,7 +353,6 @@ instead of two that drift apart.
 
 ## Roadmap
 
-- Catalog layer: expose `information_schema` so a model can see tables before querying them
 - Adapters: Spark and HBase behind the same SPI
 - Multi-instance deployment (nginx upstream, shared signing key) with a documented availability test
 - `subscriptions/listen`, tasks extension, OAuth

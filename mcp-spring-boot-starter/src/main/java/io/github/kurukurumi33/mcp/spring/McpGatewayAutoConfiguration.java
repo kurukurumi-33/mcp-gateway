@@ -1,6 +1,6 @@
 package io.github.kurukurumi33.mcp.spring;
 
-import io.github.kurukurumi33.mcp.registry.ToolRegistry;
+import io.github.kurukurumi33.mcp.registry.GatewayRegistry;
 import io.github.kurukurumi33.mcp.server.McpServerEngine;
 import io.github.kurukurumi33.mcp.server.RequestStateCodec;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
@@ -34,8 +34,8 @@ public class McpGatewayAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public ToolRegistry mcpToolRegistry(List<BackendAdapter> adapters) {
-        return new ToolRegistry(adapters);
+    public GatewayRegistry mcpGatewayRegistry(List<BackendAdapter> adapters) {
+        return new GatewayRegistry(adapters);
     }
 
     @Bean
@@ -52,7 +52,7 @@ public class McpGatewayAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public McpServerEngine mcpServerEngine(ToolRegistry registry, RequestStateCodec codec,
+    public McpServerEngine mcpServerEngine(GatewayRegistry registry, RequestStateCodec codec,
                                            McpGatewayProperties properties) {
         return new McpServerEngine(
                 registry,
@@ -77,7 +77,7 @@ public class McpGatewayAutoConfiguration {
 
         @Bean
         @ConditionalOnMissingBean
-        McpBackendHealthIndicator mcpBackendHealthIndicator(ToolRegistry registry) {
+        McpBackendHealthIndicator mcpBackendHealthIndicator(GatewayRegistry registry) {
             return new McpBackendHealthIndicator(registry);
         }
     }

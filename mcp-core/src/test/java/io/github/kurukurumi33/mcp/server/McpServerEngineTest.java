@@ -6,7 +6,7 @@ import io.github.kurukurumi33.mcp.demo.SystemAdapter;
 import io.github.kurukurumi33.mcp.protocol.Json;
 import io.github.kurukurumi33.mcp.protocol.McpProtocol;
 import io.github.kurukurumi33.mcp.protocol.McpRequest;
-import io.github.kurukurumi33.mcp.registry.ToolRegistry;
+import io.github.kurukurumi33.mcp.registry.GatewayRegistry;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
 import io.github.kurukurumi33.mcp.spi.HealthStatus;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
@@ -35,7 +35,7 @@ class McpServerEngineTest {
 
     private McpServerEngine engine(List<BackendAdapter> adapters) {
         return new McpServerEngine(
-                new ToolRegistry(adapters),
+                new GatewayRegistry(adapters),
                 RequestStateCodec.random(),
                 new McpServerEngine.ServerInfo("mcp-gateway-test", "0.1.0"));
     }
@@ -381,5 +381,159 @@ class McpServerEngineTest {
         JsonNode body = resultOf(call(engine, "warehouse_query", null));
         assertTrue(body.path("isError").asBoolean());
         assertTrue(body.path("content").get(0).path("text").asString().contains("connection refused"));
+    }
+
+    // ---------------------------------------------------------------- resources and prompts
+
+    @Test
+    @DisplayName("11. discover advertises the capabilities it now implements")
+    void discoverAdvertisesResourcesAndPrompts() {
+        JsonNode capabilities = resultOf(engine().handle(
+                request(McpProtocol.METHOD_DISCOVER, params(), null)).terminal()).path("capabilities");
+
+        assertTrue(capabilities.path("resources").isObject());
+        assertTrue(capabilities.path("prompts").isObject());
+        assertFalse(capabilities.path("resources").path("listChanged").asBoolean());
+    }
+
+    @Test
+    @DisplayName("12. resources/list publishes qualified uris and the owning backend")
+    void resourcesList() {
+        JsonNode body = resultOf(engine().handle(
+                request(McpProtocol.METHOD_RESOURCES_LIST, params(), null)).terminal());
+
+        List<String> uris = body.path("resources").valueStream()
+                .map(r -> r.path("uri").asString())
+                .toList();
+
+        assertEquals(3, uris.size());
+        assertTrue(uris.containsAll(List.of(
+                "mcp://system/gateway/about.md",
+                "mcp://storage/reports/2026-q3.parquet",
+                "mcp://storage/raw/events-0001.jsonl")));
+        assertTrue(body.has("ttlMs"));
+        assertEquals("private", body.path("cacheScope").asString());
+        assertEquals("storage", body.path("resources").get(1).path("_meta")
+                .path("io.github.kurukurumi33.mcp/backend").asString());
+    }
+
+    @Test
+    @DisplayName("13. resources/templates/list publishes the template inside its namespace")
+    void resourceTemplatesList() {
+        JsonNode body = resultOf(engine().handle(
+                request(McpProtocol.METHOD_RESOURCES_TEMPLATES_LIST, params(), null)).terminal());
+
+        assertEquals(1, body.path("resourceTemplates").size());
+        assertEquals("mcp://storage/{+key}",
+                body.path("resourceTemplates").get(0).path("uriTemplate").asString());
+    }
+
+    @Test
+    @DisplayName("14. resources/read returns inline text for a text object")
+    void readTextResource() {
+        String uri = "mcp://storage/raw/events-0001.jsonl";
+        ObjectNode params = params().put("uri", uri);
+
+        JsonNode body = resultOf(engine().handle(
+                request(McpProtocol.METHOD_RESOURCES_READ, params, uri)).terminal());
+
+        assertEquals(McpProtocol.RESULT_TYPE_COMPLETE, body.path("resultType").asString());
+        JsonNode entry = body.path("contents").get(0);
+        assertEquals(uri, entry.path("uri").asString());
+        assertEquals("application/x-ndjson", entry.path("mimeType").asString());
+        assertTrue(entry.path("text").asString().contains("\"event\":\"login\""));
+        assertFalse(entry.has("blob"));
+    }
+
+    @Test
+    @DisplayName("15. resources/read returns base64 for a binary object")
+    void readBinaryResource() {
+        String uri = "mcp://storage/reports/2026-q3.parquet";
+        ObjectNode params = params().put("uri", uri);
+
+        JsonNode entry = resultOf(engine().handle(
+                request(McpProtocol.METHOD_RESOURCES_READ, params, uri)).terminal())
+                .path("contents").get(0);
+
+        assertFalse(entry.has("text"));
+        String decoded = new String(java.util.Base64.getDecoder().decode(entry.path("blob").asString()),
+                java.nio.charset.StandardCharsets.ISO_8859_1);
+        assertTrue(decoded.startsWith("PAR1"));
+    }
+
+    @Test
+    @DisplayName("16. resources/read on an unknown path is -32602 with the uri in data")
+    void readUnknownResource() {
+        String uri = "mcp://storage/nope.txt";
+        EngineResult result = engine().handle(
+                request(McpProtocol.METHOD_RESOURCES_READ, params().put("uri", uri), uri));
+
+        assertEquals(400, result.httpStatus());
+        JsonNode error = result.terminal().path("error");
+        assertEquals(McpProtocol.INVALID_PARAMS, error.path("code").asInt());
+        assertEquals(uri, error.path("data").path("uri").asString());
+        assertFalse(result.terminal().has("result"), "must not answer with an empty contents array");
+    }
+
+    @Test
+    @DisplayName("16b. a uri with a foreign scheme is not routed anywhere")
+    void readForeignSchemeResource() {
+        // The same probe the official conformance suite sends; see sep-2164.
+        String uri = "test://nonexistent-resource-for-conformance-testing";
+        EngineResult result = engine().handle(
+                request(McpProtocol.METHOD_RESOURCES_READ, params().put("uri", uri), uri));
+
+        assertEquals(400, result.httpStatus());
+        assertEquals(uri, result.terminal().path("error").path("data").path("uri").asString());
+    }
+
+    @Test
+    @DisplayName("17. prompts/list names are namespaced and required arguments are marked")
+    void promptsList() {
+        JsonNode body = resultOf(engine().handle(
+                request(McpProtocol.METHOD_PROMPTS_LIST, params(), null)).terminal());
+
+        JsonNode prompt = body.path("prompts").get(0);
+        assertEquals("system_explain_backend", prompt.path("name").asString());
+        assertEquals("namespace", prompt.path("arguments").get(0).path("name").asString());
+        assertTrue(prompt.path("arguments").get(0).path("required").asBoolean());
+    }
+
+    @Test
+    @DisplayName("18. prompts/get renders messages through the owning adapter")
+    void promptsGet() {
+        String name = "system_explain_backend";
+        ObjectNode params = params().put("name", name)
+                .set("arguments", Json.obj().put("namespace", "storage"));
+
+        JsonNode body = resultOf(engine().handle(
+                request(McpProtocol.METHOD_PROMPTS_GET, params, name)).terminal());
+
+        assertEquals("user", body.path("messages").get(0).path("role").asString());
+        assertEquals("text", body.path("messages").get(0).path("content").path("type").asString());
+        assertTrue(body.path("messages").get(0).path("content").path("text").asString()
+                .contains("'storage'"));
+    }
+
+    @Test
+    @DisplayName("18b. prompts/get without a required argument is -32602")
+    void promptsGetMissingArgument() {
+        String name = "system_explain_backend";
+        EngineResult result = engine().handle(request(McpProtocol.METHOD_PROMPTS_GET,
+                params().put("name", name), name));
+
+        assertEquals(400, result.httpStatus());
+        assertEquals(McpProtocol.INVALID_PARAMS, errorCode(result.terminal()));
+    }
+
+    @Test
+    @DisplayName("18c. prompts/get on an unknown prompt is -32602 with the name in data")
+    void promptsGetUnknown() {
+        String name = "system_nope";
+        EngineResult result = engine().handle(request(McpProtocol.METHOD_PROMPTS_GET,
+                params().put("name", name), name));
+
+        assertEquals(400, result.httpStatus());
+        assertEquals(name, result.terminal().path("error").path("data").path("name").asString());
     }
 }

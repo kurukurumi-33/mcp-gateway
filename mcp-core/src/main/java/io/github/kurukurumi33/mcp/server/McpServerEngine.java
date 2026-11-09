@@ -4,13 +4,22 @@ import io.github.kurukurumi33.mcp.protocol.Json;
 import io.github.kurukurumi33.mcp.protocol.McpException;
 import io.github.kurukurumi33.mcp.protocol.McpProtocol;
 import io.github.kurukurumi33.mcp.protocol.McpRequest;
+import io.github.kurukurumi33.mcp.registry.GatewayRegistry;
+import io.github.kurukurumi33.mcp.registry.RegisteredPrompt;
+import io.github.kurukurumi33.mcp.registry.RegisteredResource;
+import io.github.kurukurumi33.mcp.registry.RegisteredResourceTemplate;
 import io.github.kurukurumi33.mcp.registry.RegisteredTool;
-import io.github.kurukurumi33.mcp.registry.ToolRegistry;
+import io.github.kurukurumi33.mcp.registry.ResourceUris;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
 import io.github.kurukurumi33.mcp.spi.HealthStatus;
 import io.github.kurukurumi33.mcp.spi.InputRequest;
 import io.github.kurukurumi33.mcp.spi.InputResponse;
+import io.github.kurukurumi33.mcp.spi.PromptArgument;
+import io.github.kurukurumi33.mcp.spi.PromptDefinition;
+import io.github.kurukurumi33.mcp.spi.PromptResult;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
+import io.github.kurukurumi33.mcp.spi.ResourceContent;
+import io.github.kurukurumi33.mcp.spi.ResourceDefinition;
 import io.github.kurukurumi33.mcp.spi.StreamEmitter;
 import io.github.kurukurumi33.mcp.spi.ToolDefinition;
 import io.github.kurukurumi33.mcp.spi.ToolResult;
@@ -19,6 +28,7 @@ import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -43,18 +53,19 @@ public final class McpServerEngine {
 
     /** Methods whose {@code Mcp-Name} header is mandatory and must match the body. */
     private static final Set<String> NAMED_METHODS =
-            Set.of(McpProtocol.METHOD_TOOLS_CALL, "prompts/get", McpProtocol.METHOD_RESOURCES_READ);
+            Set.of(McpProtocol.METHOD_TOOLS_CALL, McpProtocol.METHOD_PROMPTS_GET,
+                    McpProtocol.METHOD_RESOURCES_READ);
 
-    private final ToolRegistry registry;
+    private final GatewayRegistry registry;
     private final RequestStateCodec stateCodec;
     private final ServerInfo serverInfo;
     private final long cacheTtlMs;
 
-    public McpServerEngine(ToolRegistry registry, RequestStateCodec stateCodec, ServerInfo serverInfo) {
+    public McpServerEngine(GatewayRegistry registry, RequestStateCodec stateCodec, ServerInfo serverInfo) {
         this(registry, stateCodec, serverInfo, 60_000L);
     }
 
-    public McpServerEngine(ToolRegistry registry, RequestStateCodec stateCodec,
+    public McpServerEngine(GatewayRegistry registry, RequestStateCodec stateCodec,
                            ServerInfo serverInfo, long cacheTtlMs) {
         this.registry = registry;
         this.stateCodec = stateCodec;
@@ -121,6 +132,11 @@ public final class McpServerEngine {
             case McpProtocol.METHOD_DISCOVER -> EngineResult.json(discover(request));
             case McpProtocol.METHOD_TOOLS_LIST -> EngineResult.json(toolsList(request));
             case McpProtocol.METHOD_TOOLS_CALL -> toolsCall(request, liveEmitter);
+            case McpProtocol.METHOD_RESOURCES_LIST -> EngineResult.json(resourcesList(request));
+            case McpProtocol.METHOD_RESOURCES_TEMPLATES_LIST -> EngineResult.json(resourceTemplatesList(request));
+            case McpProtocol.METHOD_RESOURCES_READ -> EngineResult.json(resourcesRead(request));
+            case McpProtocol.METHOD_PROMPTS_LIST -> EngineResult.json(promptsList(request));
+            case McpProtocol.METHOD_PROMPTS_GET -> EngineResult.json(promptsGet(request));
             default -> throw McpException.methodNotFound("This server does not implement '" + method + "'");
         };
     }
@@ -219,7 +235,11 @@ public final class McpServerEngine {
 
     private JsonNode discover(McpRequest request) {
         ObjectNode capabilities = Json.obj();
+        // listChanged stays false everywhere: the catalog is built once at startup, so a client
+        // never has to subscribe to a change feed that will not fire.
         capabilities.set("tools", Json.obj().put("listChanged", false));
+        capabilities.set("resources", Json.obj().put("listChanged", false));
+        capabilities.set("prompts", Json.obj().put("listChanged", false));
 
         ArrayNode backends = Json.arr();
         for (BackendAdapter adapter : registry.adapters()) {
@@ -286,7 +306,7 @@ public final class McpServerEngine {
             throw McpException.invalidParams("tools/call requires params.name");
         }
 
-        RegisteredTool tool = registry.find(qualifiedName)
+        RegisteredTool tool = registry.findTool(qualifiedName)
                 .orElseThrow(() -> McpException.invalidParams("Unknown tool '" + qualifiedName + "'"));
 
         HealthStatus health = tool.adapter().health();
@@ -322,6 +342,223 @@ public final class McpServerEngine {
         List<JsonNode> messages = new ArrayList<>(recorder.messages());
         messages.add(response);
         return EngineResult.stream(messages);
+    }
+
+    // ------------------------------------------------------------------ resources
+
+    private JsonNode resourcesList(McpRequest request) {
+        ArrayNode resources = Json.arr();
+        for (RegisteredResource resource : registry.resources()) {
+            resources.add(describeResource(resource));
+        }
+
+        ObjectNode result = Json.obj();
+        result.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
+        result.set("resources", resources);
+        result.put("ttlMs", cacheTtlMs);
+        result.put("cacheScope", "private");
+        result.set("_meta", serverMeta());
+        return envelope(request, result);
+    }
+
+    private ObjectNode describeResource(RegisteredResource resource) {
+        ResourceDefinition def = resource.definition();
+        ObjectNode node = Json.obj();
+        node.put("uri", resource.qualifiedUri());
+        node.put("name", def.name());
+        if (def.mimeType() != null) {
+            node.put("mimeType", def.mimeType());
+        }
+        if (def.description() != null) {
+            node.put("description", def.description());
+        }
+
+        ObjectNode meta = Json.obj();
+        meta.put(META_AVAILABLE, resource.available());
+        meta.put(META_BACKEND, resource.adapter().namespace());
+        node.set("_meta", meta);
+        return node;
+    }
+
+    private JsonNode resourceTemplatesList(McpRequest request) {
+        ArrayNode templates = Json.arr();
+        for (RegisteredResourceTemplate registered : registry.resourceTemplates()) {
+            ObjectNode node = Json.obj();
+            node.put("uriTemplate", registered.qualifiedUriTemplate());
+            node.put("name", registered.template().name());
+            if (registered.template().mimeType() != null) {
+                node.put("mimeType", registered.template().mimeType());
+            }
+            if (registered.template().description() != null) {
+                node.put("description", registered.template().description());
+            }
+            templates.add(node);
+        }
+
+        ObjectNode result = Json.obj();
+        result.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
+        result.set("resourceTemplates", templates);
+        result.put("ttlMs", cacheTtlMs);
+        result.put("cacheScope", "private");
+        result.set("_meta", serverMeta());
+        return envelope(request, result);
+    }
+
+    /**
+     * Reads one resource.
+     *
+     * <p>A uri the gateway does not own and a path its backend does not have are the same answer
+     * here, {@code -32602} with the uri in {@code error.data}, because the client asked for something
+     * that does not exist and has no way to act on the difference. This is deliberately not the
+     * tool-error shape: the model is not making this call, the host is, so the host must see it fail.
+     */
+    private JsonNode resourcesRead(McpRequest request) {
+        JsonNode params = request.params();
+        String uri = params == null ? null : firstText(params, "uri");
+        if (uri == null || uri.isBlank()) {
+            throw McpException.invalidParams("resources/read requires params.uri");
+        }
+
+        ResourceUris.Parsed target = registry.resourceTarget(uri).orElseThrow(() -> resourceNotFound(uri));
+        BackendAdapter adapter = registry.adapter(target.namespace()).orElseThrow(() -> resourceNotFound(uri));
+
+        HealthStatus health = adapter.health();
+        if (!health.isCallable()) {
+            throw new McpException(McpProtocol.INTERNAL_ERROR, 503,
+                    "Backend '" + adapter.namespace() + "' is unavailable: " + health.detail());
+        }
+
+        ResourceContent content = adapter.readResource(target.uri()).orElseThrow(() -> resourceNotFound(uri));
+
+        ObjectNode entry = Json.obj();
+        entry.put("uri", uri);
+        if (content.mimeType() != null) {
+            entry.put("mimeType", content.mimeType());
+        }
+        if (content.isBinary()) {
+            entry.put("blob", Base64.getEncoder().encodeToString(content.blob()));
+        } else {
+            entry.put("text", content.text());
+        }
+
+        ObjectNode result = Json.obj();
+        result.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
+        result.set("contents", Json.arr().add(entry));
+        result.put("ttlMs", cacheTtlMs);
+        result.put("cacheScope", "private");
+        result.set("_meta", serverMeta());
+        return envelope(request, result);
+    }
+
+    private static McpException resourceNotFound(String uri) {
+        return new McpException(McpProtocol.INVALID_PARAMS, 400,
+                "Resource not found: " + uri, Json.obj().put("uri", uri));
+    }
+
+    // ------------------------------------------------------------------ prompts
+
+    private JsonNode promptsList(McpRequest request) {
+        ArrayNode prompts = Json.arr();
+        for (RegisteredPrompt prompt : registry.prompts()) {
+            prompts.add(describePrompt(prompt));
+        }
+
+        ObjectNode result = Json.obj();
+        result.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
+        result.set("prompts", prompts);
+        result.put("ttlMs", cacheTtlMs);
+        result.put("cacheScope", "private");
+        result.set("_meta", serverMeta());
+        return envelope(request, result);
+    }
+
+    private ObjectNode describePrompt(RegisteredPrompt prompt) {
+        PromptDefinition def = prompt.definition();
+        ObjectNode node = Json.obj();
+        node.put("name", prompt.qualifiedName());
+        if (def.description() != null) {
+            node.put("description", def.description());
+        }
+        if (!def.arguments().isEmpty()) {
+            ArrayNode arguments = Json.arr();
+            for (PromptArgument argument : def.arguments()) {
+                ObjectNode arg = Json.obj().put("name", argument.name());
+                if (argument.description() != null) {
+                    arg.put("description", argument.description());
+                }
+                if (argument.required()) {
+                    arg.put("required", true);
+                }
+                arguments.add(arg);
+            }
+            node.set("arguments", arguments);
+        }
+        return node;
+    }
+
+    private JsonNode promptsGet(McpRequest request) {
+        JsonNode params = request.params();
+        String qualifiedName = params == null ? null : firstText(params, "name");
+        if (qualifiedName == null) {
+            throw McpException.invalidParams("prompts/get requires params.name");
+        }
+
+        RegisteredPrompt prompt = registry.findPrompt(qualifiedName)
+                .orElseThrow(() -> promptNotFound(qualifiedName));
+
+        HealthStatus health = prompt.adapter().health();
+        if (!health.isCallable()) {
+            throw new McpException(McpProtocol.INTERNAL_ERROR, 503,
+                    "Backend '" + prompt.adapter().namespace() + "' is unavailable: " + health.detail());
+        }
+
+        JsonNode arguments = Json.orNull(params, "arguments");
+        JsonNode supplied = arguments == null ? Json.obj() : arguments;
+        validatePromptArguments(prompt.definition(), qualifiedName, supplied);
+
+        PromptResult rendered = prompt.adapter()
+                .getPrompt(prompt.definition().name(), supplied)
+                .orElseThrow(() -> promptNotFound(qualifiedName));
+
+        ObjectNode result = Json.obj();
+        result.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
+        if (rendered.description() != null) {
+            result.put("description", rendered.description());
+        }
+        ArrayNode messages = Json.arr();
+        rendered.messages().forEach(messages::add);
+        result.set("messages", messages);
+        result.set("_meta", serverMeta());
+        return envelope(request, result);
+    }
+
+    private static McpException promptNotFound(String name) {
+        return new McpException(McpProtocol.INVALID_PARAMS, 400,
+                "Prompt not found: " + name, Json.obj().put("name", name));
+    }
+
+    /**
+     * Rejects a call that omits a required prompt argument.
+     *
+     * <p>Done here rather than in each adapter because the arguments are declared in
+     * {@link PromptDefinition}, and the protocol wants this answer as {@code -32602} rather than as an
+     * empty result, which the adapter's {@code Optional} could not distinguish from an unknown prompt.
+     */
+    private static void validatePromptArguments(PromptDefinition definition, String qualifiedName,
+                                                JsonNode arguments) {
+        if (!arguments.isObject()) {
+            throw McpException.invalidParams("prompts/get params.arguments must be an object");
+        }
+        for (PromptArgument argument : definition.arguments()) {
+            if (!argument.required()) {
+                continue;
+            }
+            JsonNode value = Json.orNull(arguments, argument.name());
+            if (value == null || (value.isTextual() && value.asString().isBlank())) {
+                throw McpException.invalidParams("prompt '" + qualifiedName
+                        + "' requires argument '" + argument.name() + "'");
+            }
+        }
     }
 
     // ------------------------------------------------------------------ result shaping

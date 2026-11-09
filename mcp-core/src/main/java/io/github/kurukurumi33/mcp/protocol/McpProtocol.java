@@ -41,8 +41,10 @@ public final class McpProtocol {
     public static final String METHOD_TOOLS_LIST = "tools/list";
     public static final String METHOD_TOOLS_CALL = "tools/call";
     public static final String METHOD_PROMPTS_LIST = "prompts/list";
+    public static final String METHOD_PROMPTS_GET = "prompts/get";
     public static final String METHOD_RESOURCES_LIST = "resources/list";
     public static final String METHOD_RESOURCES_READ = "resources/read";
+    public static final String METHOD_RESOURCES_TEMPLATES_LIST = "resources/templates/list";
 
     // ---- JSON-RPC / MCP error codes (2026-07-28 segmentation) ----
 

@@ -5,6 +5,8 @@ import io.github.kurukurumi33.mcp.spi.BackendAdapter;
 import io.github.kurukurumi33.mcp.spi.HealthStatus;
 import io.github.kurukurumi33.mcp.spi.InputRequest;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
+import io.github.kurukurumi33.mcp.spi.ResourceContent;
+import io.github.kurukurumi33.mcp.spi.ResourceTemplate;
 import io.github.kurukurumi33.mcp.spi.ToolDefinition;
 import io.github.kurukurumi33.mcp.spi.ToolResult;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -27,10 +29,14 @@ import tools.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Object storage exposed over the S3 API.
@@ -143,6 +149,61 @@ public final class S3StorageAdapter implements BackendAdapter {
             return HealthStatus.UP;
         } catch (RuntimeException e) {
             return HealthStatus.down("bucket '" + bucket + "' unreachable: " + e.getMessage());
+        }
+    }
+
+    /**
+     * One template instead of a listing: the bucket may hold millions of keys, and
+     * {@link #resources()} may not contact the network to enumerate them.
+     */
+    @Override
+    public List<ResourceTemplate> resourceTemplates() {
+        return List.of(ResourceTemplate.of("{+key}", "any object in '" + bucket + "'", null));
+    }
+
+    /**
+     * Streams one object out of the bucket.
+     *
+     * <p>The text/blob decision is made from the bytes, not from the declared content type, because
+     * things uploaded by hand routinely arrive as {@code application/octet-stream} while still being
+     * plain text. A 404 is "no such resource"; anything else is a real failure and is surfaced as one
+     * rather than disguised as a missing key.
+     */
+    @Override
+    public Optional<ResourceContent> readResource(String uri) {
+        try (ResponseInputStream<GetObjectResponse> stream = client.getObject(
+                GetObjectRequest.builder().bucket(bucket).key(uri).build())) {
+            byte[] bytes = stream.readAllBytes();
+            String mimeType = stream.response().contentType();
+            return Optional.of(isProbablyText(bytes)
+                    ? ResourceContent.text(uri, mimeType, new String(bytes, StandardCharsets.UTF_8))
+                    : ResourceContent.binary(uri, mimeType, bytes));
+        } catch (S3Exception e) {
+            if (e.statusCode() == 404) {
+                return Optional.empty();
+            }
+            throw new IllegalStateException(
+                    "Could not read '" + uri + "': " + e.awsErrorDetails().errorMessage(), e);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not read the body of '" + uri + "'", e);
+        }
+    }
+
+    /** Valid UTF-8 with no NUL bytes; NUL practically never occurs in text and is common in binaries. */
+    private static boolean isProbablyText(byte[] bytes) {
+        for (byte b : bytes) {
+            if (b == 0) {
+                return false;
+            }
+        }
+        try {
+            StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes));
+            return true;
+        } catch (CharacterCodingException e) {
+            return false;
         }
     }
 

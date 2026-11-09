@@ -4,7 +4,7 @@ import io.github.kurukurumi33.mcp.demo.ComputeAdapter;
 import io.github.kurukurumi33.mcp.demo.StorageAdapter;
 import io.github.kurukurumi33.mcp.demo.SystemAdapter;
 import io.github.kurukurumi33.mcp.registry.RegisteredTool;
-import io.github.kurukurumi33.mcp.registry.ToolRegistry;
+import io.github.kurukurumi33.mcp.registry.GatewayRegistry;
 import io.github.kurukurumi33.mcp.server.McpServerEngine;
 import io.github.kurukurumi33.mcp.server.RequestStateCodec;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
@@ -41,7 +41,7 @@ public final class DevServerMain {
                 new StorageAdapter(),
                 new ComputeAdapter());
 
-        ToolRegistry registry = new ToolRegistry(adapters);
+        GatewayRegistry registry = new GatewayRegistry(adapters);
         McpServerEngine engine = new McpServerEngine(
                 registry,
                 new RequestStateCodec(secret()),
@@ -52,7 +52,7 @@ public final class DevServerMain {
         System.out.println("MCP 2026-07-28 stateless server listening on http://127.0.0.1:"
                 + server.port() + "/mcp");
         System.out.println("Registry: " + registry.adapters().size() + " backend(s), "
-                + registry.size() + " tool(s)");
+                + registry.toolCount() + " tool(s)");
         for (RegisteredTool tool : registry.tools()) {
             System.out.println("  - " + tool.qualifiedName() + "   ["
                     + tool.adapter().namespace() + "]  " + tool.definition().description());

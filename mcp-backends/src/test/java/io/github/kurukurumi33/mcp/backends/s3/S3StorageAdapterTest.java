@@ -9,6 +9,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Behaviour that must hold without a storage server: the catalog is static, and an unreachable
@@ -34,5 +35,14 @@ class S3StorageAdapterTest {
     @DisplayName("an unreachable store reports DOWN instead of throwing")
     void healthDegradesInsteadOfFailing() {
         assertFalse(unreachable().health().isCallable());
+    }
+
+    @Test
+    @DisplayName("resources are not enumerated; one template covers every key")
+    void resourcesAreTemplated() {
+        S3StorageAdapter adapter = unreachable();
+
+        assertTrue(adapter.resources().isEmpty());
+        assertEquals("{+key}", adapter.resourceTemplates().get(0).uriTemplate());
     }
 }

@@ -1,6 +1,9 @@
 package io.github.kurukurumi33.mcp.spi;
 
+import tools.jackson.databind.JsonNode;
+
 import java.util.List;
+import java.util.Optional;
 
 /**
  * The extension point of the gateway: one implementation per backend you want to expose over MCP.
@@ -66,6 +69,55 @@ public interface BackendAdapter {
      * @return a completed result, a failure, or a request for more input
      */
     ToolResult execute(String toolName, RequestContext context);
+
+    /**
+     * Readable resources this backend publishes, with backend-local uris.
+     *
+     * <p>Same rule as {@link #tools()}: describe, do not fetch. Listing must not open a connection or
+     * read an object, because it runs on every {@code resources/list}.
+     */
+    default List<ResourceDefinition> resources() {
+        return List.of();
+    }
+
+    /**
+     * Families of resources that cannot be enumerated, expressed as RFC 6570 templates.
+     *
+     * <p>An object store with a million keys publishes one template instead of a million entries.
+     */
+    default List<ResourceTemplate> resourceTemplates() {
+        return List.of();
+    }
+
+    /**
+     * Reads one resource by its backend-local uri, or returns empty when this backend has nothing at
+     * that uri.
+     *
+     * <p>Empty is not a failure to report to the model: the protocol wants {@code resources/read} on
+     * an unknown uri to be a JSON-RPC error, so the engine turns it into {@code -32602} with the uri
+     * in {@code error.data}. This is the opposite of tools, where a bad argument is reported inside a
+     * successful result. A resource read is the client's own request, so the client is the one who
+     * must see the error.
+     */
+    default Optional<ResourceContent> readResource(String uri) {
+        return Optional.empty();
+    }
+
+    /** Prompt templates this backend offers, named without the namespace prefix. */
+    default List<PromptDefinition> prompts() {
+        return List.of();
+    }
+
+    /**
+     * Renders one prompt into messages, or returns empty when no prompt by that name exists.
+     *
+     * @param promptName unqualified name, as returned from {@link #prompts()}
+     * @param arguments  the caller's arguments, possibly empty but never null; an adapter decides
+     *                   which ones are required
+     */
+    default Optional<PromptResult> getPrompt(String promptName, JsonNode arguments) {
+        return Optional.empty();
+    }
 
     /**
      * Current reachability of the backend behind this adapter.
