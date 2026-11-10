@@ -118,22 +118,21 @@ npx @modelcontextprotocol/conformance@alpha server \
   --url http://127.0.0.1:8931/mcp --suite draft
 ```
 
-Current result: **79 passed, 9 failed** across the draft server scenarios.
+Current result: **85 passed, 6 failed** across the draft server scenarios.
 
 | Scenario | Result |
 |---|---|
 | `server-stateless` | 25 / 25 |
 | `http-header-validation` | 14 / 14 |
-| `input-required-result-*` (13 scenarios) | all pass except the prompt-based one |
-| `sep-2164-resource-not-found` | 2 / 2 |
-| `caching` | 4 / 7 |
+| `input-required-result-*` (13 scenarios) | 12 fully pass; `non-tool-request` is 1 / 2 |
+| `sep-2164-resource-not-found` | 4 / 4 |
+| `caching` | 8 / 8 |
 | `http-custom-header-server-validation` | 1 / 6 |
-| `input-required-result-non-tool-request` | 1 / 2 |
 
-Those figures predate the resources and prompts wiring. The scenarios that were failing for missing
-features — the caching hints on `resources/list` and `prompts/list`, `resources/read`, and the
-prompt-based input-required case — are now reachable; the numbers need a rerun before they are quoted
-again. The one known gap that remains is the `x-mcp-header` extension.
+The six remaining failures are two features rather than protocol errors. Five belong to the
+`x-mcp-header` extension, which is not implemented. The sixth is `prompts/get` returning an
+`input_required` result: multi-round requests are implemented for `tools/call` only, and `PromptResult`
+has no shape for asking the client anything.
 
 The `test_*` fixtures the suite drives live in `mcp-core/.../conformance/` and are registered only
 when `mcp.gateway.conformance-fixtures` is true.
