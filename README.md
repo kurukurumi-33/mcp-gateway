@@ -116,6 +116,45 @@ docker compose down          # keep the volume
 docker compose down -v       # drop the objects too
 ```
 
+## Multi-instance
+
+The protocol's claim is that any node can serve any request. `docker/multi-instance-demo.sh`
+turns that from a design note into an experiment:
+
+```bash
+bash docker/multi-instance-demo.sh
+```
+
+It starts two gateway instances behind nginx and runs eight steps.
+
+| Step | What happens | What it establishes |
+|---|---|---|
+| 1 | `storage_put_text` on node A writes `demo/incident.txt` | a shared backend, so the object exists for both nodes |
+| 2 | `storage_delete_object` on node A answers `input_required` plus a `requestState` | the round ended without the server keeping anything |
+| 3 | node A is stopped | the node that asked the question is gone |
+| 4 | the token is replayed against node B with the confirmation | the rest of the call needs nothing from A |
+| 5 | node B lists the bucket and the key is gone | the effect really happened, not just a 200 |
+| 6 | the token's payload is edited and replayed | `-32602`, `requestState failed signature verification` |
+| 7 | with A still down, three `tools/list` requests go through nginx | no sticky sessions, and the balancer can use the other node |
+| 8 | node A is started again | the stack is left usable |
+
+Two things make step 4 possible. The round-1 response carries the whole state, so there is nothing on
+A to lose. And both containers are given the same `MCP_REQUEST_STATE_SECRET`, so B can verify a token
+A signed. Step 4 also asserts the response has no `Mcp-Session-Id` header, which is the field this
+revision deleted.
+
+The limits are worth stating plainly, because "stateless" describes the protocol layer, not the
+whole system:
+
+- **An adapter must be stateless for the same test to pass.** The in-memory demo `StorageAdapter`
+  would fail it: the object it wrote lives in A's heap. The S3 adapter passes because the bucket is
+  the shared state, which is what step 1 is there to set up.
+- **A stream that dies cannot be resumed.** Progress notifications ride the response body of one
+  request. If the node carrying that body is killed, the client sees a truncated stream; only the
+  next round of a multi-round call is recoverable, and only because the client holds the token.
+- **One key, no rotation.** Every instance needs the same secret, so rotating it invalidates all
+  tokens in flight at the moment of the swap.
+
 ## Testing
 
 `mvn verify` runs 59 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
@@ -368,7 +407,10 @@ mcp-gateway/
 │       └── demo/              three in-memory sample adapters
 ├── mcp-backends/              real adapters: S3StorageAdapter (any S3 endpoint), DuckDBQueryAdapter
 ├── mcp-spring-boot-starter/   autoconfiguration, POST endpoint, actuator health contributor
-└── mcp-app/                   runnable sample: the starter with demo and real adapters
+├── mcp-app/                   runnable sample: the starter with demo and real adapters
+├── docker/                    nginx config, bucket bootstrap, multi-instance demo
+├── docker-compose.yml         gateway plus S3-compatible storage in one command
+└── docker-compose.multi.yml   two instances behind nginx, for the failover experiment
 ```
 
 `mcp-core` has no Spring dependency, so the engine and SPI work in any Java runtime. The starter is one
@@ -391,7 +433,8 @@ instead of two that drift apart.
 ## Roadmap
 
 - Adapters: Spark and HBase behind the same SPI
-- Multi-instance deployment (nginx upstream, shared signing key) with a documented availability test
+- `prompts/get` returning `input_required`, so multi-round prompts work as `tools/call` does
+- The `x-mcp-header` extension, which the last five conformance checks cover
 - `subscriptions/listen`, tasks extension, OAuth
 
 ## License
