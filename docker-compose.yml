@@ -1,0 +1,57 @@
+name: mcp-gateway
+
+services:
+  # S3-compatible storage. MinIO pulled its Docker Hub images in 2025, so this stack
+  # uses SeaweedFS, which speaks the same API on :8333.
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: server -dir=/data -s3 -s3.port=8333
+    ports:
+      - "8333:8333" # S3 API
+      - "9333:9333" # master
+      - "8888:8888" # filer
+    volumes:
+      - seaweed-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot: the adapter's health() is a HeadBucket, and nothing in the gateway ever
+  # creates a bucket, so it has to exist before the gateway starts or its health is DOWN.
+  createbucket:
+    image: curlimages/curl:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      MCP_S3_BUCKET: ${MCP_S3_BUCKET:-mcp-demo}
+    volumes:
+      - ./docker/create-bucket.sh:/bootstrap/create-bucket.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap/create-bucket.sh"]
+    restart: "no"
+
+  gateway:
+    build: .
+    image: mcp-gateway:0.1.0
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      MCP_S3_ENDPOINT: http://seaweedfs:8333
+      MCP_S3_REGION: us-east-1
+      MCP_S3_ACCESS_KEY: ${MCP_S3_ACCESS_KEY:-mcpaccess}
+      MCP_S3_SECRET_KEY: ${MCP_S3_SECRET_KEY:-mcpsecretmcpsecret}
+      MCP_S3_BUCKET: ${MCP_S3_BUCKET:-mcp-demo}
+      # Fixed on purpose: a requestState signed by one instance must verify on any
+      # other. Left blank, the app generates a random key per process.
+      MCP_REQUEST_STATE_SECRET: ${MCP_REQUEST_STATE_SECRET:-docker-compose-demo-signing-key-0123456789}
+    ports:
+      - "8931:8931"
+    restart: unless-stopped
+
+volumes:
+  seaweed-data:

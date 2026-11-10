@@ -82,6 +82,40 @@ request that omits either one is rejected as invalid params rather than defaulte
 Ask for `Accept: text/event-stream` on a call whose tool reports progress and the response switches to
 SSE; without it you get a single JSON body.
 
+## Docker
+
+The whole stack — gateway, object storage, bucket — comes up with one command:
+
+```bash
+docker compose up --build -d
+curl -s http://127.0.0.1:8931/actuator/health
+```
+
+Three services, and each exists for a reason visible at runtime:
+
+| Service | Why it is a separate container |
+|---|---|
+| `seaweedfs` | an S3 endpoint that is not AWS, so the adapter is exercised against the same API a real deployment uses. MinIO was the obvious choice until it pulled its Docker Hub images in 2025; SeaweedFS serves the same protocol on `:8333` |
+| `createbucket` | the adapter's `health()` is a `HeadBucket`, and nothing in the gateway ever creates a bucket — so `docker/create-bucket.sh` runs once and exits before the gateway starts |
+| `gateway` | the multi-stage image; the build stage compiles with `maven:3.9-eclipse-temurin-21`, the runtime stage is a JRE with a non-root user and a healthcheck on `/actuator/health` |
+
+`MCP_REQUEST_STATE_SECRET` is pinned in `docker-compose.yml` rather than left to the random per-process
+key. That is what makes a second replica possible: a `requestState` signed by one instance has to
+verify on the other, so the key is deployment-wide state, not process state.
+
+The S3 integration tests point at the same storage the compose stack exposes:
+
+```bash
+MCP_S3_ENDPOINT=http://127.0.0.1:8333 \
+MCP_S3_ACCESS_KEY=mcpaccess MCP_S3_SECRET_KEY=mcpsecretmcpsecret \
+mvn -pl mcp-backends -am test
+```
+
+```bash
+docker compose down          # keep the volume
+docker compose down -v       # drop the objects too
+```
+
 ## Testing
 
 `mvn verify` runs 59 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
@@ -90,14 +124,18 @@ the same command on every push against JDK 21, which is the release target rathe
 | Module | Line coverage | What the tests are for |
 |---|---|---|
 | `mcp-core` | 86% | protocol constants, the engine's header and `_meta` validation, MRTR round trips, `requestState` signing, the three catalogs |
-| `mcp-backends` | 62% | S3 adapter (unit), DuckDB guard, truncation, catalog and error shaping |
+| `mcp-backends` | 79% | S3 adapter (unit and against SeaweedFS), DuckDB guard, truncation, catalog and error shaping |
 | `mcp-spring-boot-starter` | 75% | the HTTP endpoint over a real port: status codes, SSE switch, actuator aggregation |
 
 Two exclusions are deliberate. `mcp-core` skips `devtools/` and `conformance/` in the report: the dev
 server is a harness no test drives, and the conformance fixtures exist to be called over the wire by
-the official suite, so counting them would measure code nothing here executes. `mcp-backends` sits
-lower because both the three S3 integration tests and the S3 `readResource` path need a live bucket;
-that is the gap between 62% here and what the same module reports with storage running.
+the official suite, so counting them would measure code nothing here executes.
+
+The `mcp-backends` figure is the one measured with storage running — `docker compose up -d seaweedfs`,
+then the same `mvn verify` with `MCP_S3_ENDPOINT` set. Without it the three S3 integration tests skip
+themselves and the module reports 62%, which is what the gap between the two numbers is: the adapter's
+upload, listing, delete-with-confirmation and `readResource` paths all need a real endpoint. CI runs
+the same SeaweedFS container so the number there matches this one.
 
 What the tests cannot reach is the reason `docs/manual-tests.http` exists: an HTTP status code that
 disagrees with the JSON-RPC body, a `Content-Type` that should have switched to `text/event-stream`,
