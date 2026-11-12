@@ -21,6 +21,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 
 /**
@@ -47,13 +48,14 @@ public class McpGatewayAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public RequestStateCodec mcpRequestStateCodec(McpGatewayProperties properties) {
+        Duration ttl = Duration.ofSeconds(properties.getRequestStateTtlSeconds());
         String secret = properties.getRequestStateSecret();
         if (secret == null || secret.isBlank()) {
             log.warn("mcp.gateway.request-state-secret is not set; using a random key. "
                     + "Multi-round calls will not survive a restart. Set a stable secret in production.");
-            return RequestStateCodec.random();
+            return RequestStateCodec.random(ttl);
         }
-        return new RequestStateCodec(secret.getBytes(StandardCharsets.UTF_8));
+        return new RequestStateCodec(secret.getBytes(StandardCharsets.UTF_8), ttl);
     }
 
     @Bean

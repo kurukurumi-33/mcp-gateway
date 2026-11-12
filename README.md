@@ -153,7 +153,8 @@ whole system:
   request. If the node carrying that body is killed, the client sees a truncated stream; only the
   next round of a multi-round call is recoverable, and only because the client holds the token.
 - **One key, no rotation.** Every instance needs the same secret, so rotating it invalidates all
-  tokens in flight at the moment of the swap.
+  tokens in flight at the moment of the swap. Expiry is checked against each instance's own clock,
+  so replicas need NTP-synced time; a clock more than the TTL ahead rejects tokens early.
 
 ## Concurrency and deadlines
 
@@ -185,6 +186,12 @@ Two limits are worth stating plainly:
 - **The bulkhead is per process.** With four instances the effective limit is four times the
   configured one. The shared token bucket below fixes this for request rate; concurrency in flight
   is still counted per instance.
+
+The HTTP transport has its own ceiling. `max-request-bytes` (default 1 MiB) is checked against
+`Content-Length` and, because a chunked request declares no length, against the bytes as they are
+read. Anything larger gets `413` with `-32600` and `error.data.maxBytes` before the JSON is parsed.
+The controller deliberately does not use `@RequestBody`: that would buffer and deserialize the whole
+payload before any limit could apply.
 
 ## Shared rate limiting
 
@@ -549,6 +556,8 @@ mcp:
     path: /mcp
     server-name: my-gateway
     request-state-secret: ${MCP_REQUEST_STATE_SECRET}
+    request-state-ttl-seconds: 900
+    max-request-bytes: 1048576
 ```
 
 Everything else — registry, engine, controller, health contributor — is autoconfigured and every bean
@@ -625,11 +634,19 @@ thin binding; adapters behind the same SPI need nothing else.
 
 ## Notes on two deliberate choices
 
-**`requestState` is signed.** Removing sessions left one place for the server to remember a call in
-flight: an opaque token the client replays. Anything holding that token can edit it. Since the gateway
-acts on what comes back, an unsigned token would let a caller rewrite the operation it is resuming.
-Tokens are `base64url(payload).base64url(HMAC-SHA256(payload))`, and a bad signature is a hard
-`-32602` rather than a fallback — a token that does not verify is not stale, it is forged.
+**`requestState` is signed and expires.** Removing sessions left one place for the server to remember
+a call in flight: an opaque token the client replays. Anything holding that token can edit it. Since
+the gateway acts on what comes back, an unsigned token would let a caller rewrite the operation it is
+resuming. Tokens are `base64url(envelope).base64url(HMAC-SHA256(envelope))`, where the envelope is
+`{"exp": <epoch seconds>, "state": <handler state>}`, and a bad signature is a hard `-32602` rather
+than a fallback — a token that does not verify is not stale, it is forged.
+
+Expiry solves the other half. Without it a correctly signed token is valid forever, because there is
+no record of which tokens were already used — and keeping such a record is exactly the shared state
+the protocol set out to remove. `request-state-ttl-seconds` (default 15 minutes) bounds how long a
+captured token can be replayed. Making tokens strictly single-use would need a nonce store in Redis
+or a table; with no such store, the honest claim is that replay is bounded, not eliminated. Older
+tokens with no `exp` are rejected rather than accepted as eternal.
 
 **Streaming is progress notifications, not a separate API.** MCP has no "streaming tool result": the
 final result is a single message, and interim feedback travels as `notifications/progress`. So

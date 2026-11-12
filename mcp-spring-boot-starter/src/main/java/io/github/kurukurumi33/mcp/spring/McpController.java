@@ -9,12 +9,13 @@ import io.github.kurukurumi33.mcp.spi.StreamEmitter;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -46,12 +47,21 @@ public class McpController {
     }
 
     @PostMapping("${mcp.gateway.path:/mcp}")
-    public void handle(HttpServletRequest request, HttpServletResponse response,
-                       @RequestBody(required = false) String body) throws IOException {
+    public void handle(HttpServletRequest request, HttpServletResponse response) throws IOException {
+
+        String body;
+        try {
+            body = readBody(request, properties.getMaxRequestBytes());
+        } catch (McpException e) {
+            // The connection is closed because the client may still be sending the part we refused.
+            response.setHeader("Connection", "close");
+            writeJson(response, e.httpStatus(), parseError(e));
+            return;
+        }
 
         McpRequest mcpRequest;
         try {
-            mcpRequest = new McpRequest(headerMap(request), Json.parse(body == null ? "" : body));
+            mcpRequest = new McpRequest(headerMap(request), Json.parse(body));
         } catch (McpException e) {
             // The body could not be parsed, so there is no id to echo back.
             writeJson(response, e.httpStatus(), parseError(e));
@@ -96,6 +106,34 @@ public class McpController {
         return headers;
     }
 
+    /**
+     * Reads the body with a hard ceiling instead of letting Spring buffer it whole.
+     *
+     * <p>{@code @RequestBody String} would deserialize the entire payload before any validation
+     * could run, so a single large request could exhaust the heap no matter what the protocol layer
+     * says. {@code Content-Length} is checked first, but it is only a hint: a chunked request has no
+     * length at all, which is why the stream is counted as it is read.
+     */
+    private static String readBody(HttpServletRequest request, int limit) throws IOException {
+        long declared = request.getContentLengthLong();
+        if (declared > limit) {
+            throw McpException.requestTooLarge(limit);
+        }
+        try (InputStream in = request.getInputStream()) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream(
+                    declared > 0 ? (int) Math.min(declared, 8_192L) : 256);
+            byte[] chunk = new byte[8_192];
+            int read;
+            while ((read = in.read(chunk)) != -1) {
+                if (out.size() + (long) read > limit) {
+                    throw McpException.requestTooLarge(limit);
+                }
+                out.write(chunk, 0, read);
+            }
+            return out.toString(StandardCharsets.UTF_8);
+        }
+    }
+
     private static void writeJson(HttpServletResponse response, int status, JsonNode message)
             throws IOException {
         response.setStatus(status);
@@ -105,12 +143,16 @@ public class McpController {
     }
 
     private static JsonNode parseError(McpException e) {
+        ObjectNode error = Json.obj()
+                .put("code", e.code())
+                .put("message", e.getMessage());
+        if (e.data() != null && !e.data().isNull()) {
+            error.set("data", e.data());
+        }
         return Json.obj()
                 .put("jsonrpc", "2.0")
                 .putNull("id")
-                .set("error", Json.obj()
-                        .put("code", e.code())
-                        .put("message", e.getMessage()));
+                .set("error", error);
     }
 
     /**

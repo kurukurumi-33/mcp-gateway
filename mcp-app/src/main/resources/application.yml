@@ -23,6 +23,12 @@ mcp:
     cache-ttl-ms: 60000
     streaming-enabled: true
 
+    # Refuse oversized bodies before parsing. Chunked requests have no Content-Length, so they are
+    # counted as they are read instead.
+    max-request-bytes: ${MCP_MAX_REQUEST_BYTES:1048576}
+    # A requestState older than this is rejected; duration bounds how long a captured token replays.
+    request-state-ttl-seconds: ${MCP_REQUEST_STATE_TTL_SECONDS:900}
+
     # Each backend namespace gets its own slot pool, so one slow backend cannot starve the others.
     # 0 for max-concurrent disables the bulkhead; 0 for the queue wait sheds callers immediately.
     max-concurrent-calls-per-backend: 16

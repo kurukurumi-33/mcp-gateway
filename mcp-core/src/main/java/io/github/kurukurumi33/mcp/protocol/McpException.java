@@ -81,6 +81,19 @@ public class McpException extends RuntimeException {
         return new McpException(McpProtocol.INVALID_PARAMS, 400, message);
     }
 
+    /**
+     * The request body is larger than the transport is willing to buffer.
+     *
+     * <p>413 with {@code -32600}: there is no MCP-specific "too large" code, and the request as a
+     * whole is invalid. The limit travels in {@code error.data} so a client can see what to shrink
+     * to instead of guessing.
+     */
+    public static McpException requestTooLarge(long limitBytes) {
+        return new McpException(McpProtocol.INVALID_REQUEST, 413,
+                "Request body exceeds the " + limitBytes + "-byte limit",
+                Json.obj().put("maxBytes", limitBytes));
+    }
+
     public static McpException methodNotFound(String message) {
         return new McpException(McpProtocol.METHOD_NOT_FOUND, 404, message);
     }

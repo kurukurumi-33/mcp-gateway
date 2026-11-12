@@ -32,6 +32,19 @@ public class McpGatewayProperties {
     /** When false, everything is buffered and returned as a single JSON response. */
     private boolean streamingEnabled = true;
 
+    /**
+     * Largest request body the HTTP transport will read, in bytes. Anything bigger is answered with
+     * 413 before the JSON is parsed, so a single request cannot exhaust the heap.
+     */
+    private int maxRequestBytes = 1_048_576;
+
+    /**
+     * How long a {@code requestState} token stays valid, in seconds. Multi-round calls are usually
+     * human-in-the-loop, so this has to survive a pause for a confirmation; it also bounds how long
+     * a captured token can be replayed. Must be positive.
+     */
+    private long requestStateTtlSeconds = 900;
+
     /** Calls allowed to run against one backend at once; 0 disables the bulkhead. */
     private int maxConcurrentCallsPerBackend = 16;
 
@@ -101,6 +114,22 @@ public class McpGatewayProperties {
 
     public void setStreamingEnabled(boolean streamingEnabled) {
         this.streamingEnabled = streamingEnabled;
+    }
+
+    public int getMaxRequestBytes() {
+        return maxRequestBytes;
+    }
+
+    public void setMaxRequestBytes(int maxRequestBytes) {
+        this.maxRequestBytes = maxRequestBytes;
+    }
+
+    public long getRequestStateTtlSeconds() {
+        return requestStateTtlSeconds;
+    }
+
+    public void setRequestStateTtlSeconds(long requestStateTtlSeconds) {
+        this.requestStateTtlSeconds = requestStateTtlSeconds;
     }
 
     public int getMaxConcurrentCallsPerBackend() {
