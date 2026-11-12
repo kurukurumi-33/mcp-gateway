@@ -155,16 +155,142 @@ whole system:
 - **One key, no rotation.** Every instance needs the same secret, so rotating it invalidates all
   tokens in flight at the moment of the swap.
 
+## Concurrency and deadlines
+
+Every backend is a separate resource, so each namespace gets its own bulkhead: at most
+`max-concurrent-calls-per-backend` calls run at once, and callers that cannot get a slot are turned
+away instead of queueing behind a slow one.
+
+| Situation | HTTP | JSON-RPC code | Carried in the response |
+|---|---|---|---|
+| every slot on the backend is taken | 429 | `-32000` | `Retry-After: 1`, `error.data.{backend,operation,maxConcurrent}` |
+| the call outlived the deadline | 504 | `-32001` | `error.data.{backend,operation,timeoutMs}` |
+
+```yaml
+mcp:
+  gateway:
+    max-concurrent-calls-per-backend: 16   # 0 disables the bulkhead
+    max-queued-calls-per-backend: 32       # only used when a queue wait is configured
+    admission-queue-wait-ms: 0             # 0 sheds at once instead of waiting
+    call-timeout-ms: 30000                 # 0 disables the deadline
+```
+
+Two limits are worth stating plainly:
+
+- **Cancellation is cooperative.** `Thread.interrupt` only wakes a thread blocked in
+  `sleep`/`wait`/`park` or an `InterruptibleChannel`; a thread blocked in a socket read or inside a
+  native JDBC call never checks the flag. A timed-out call therefore usually keeps running, and
+  correctly keeps its slot until it really finishes. The gateway stops *waiting*; it cannot stop the
+  work — that has to come from the client library's own timeout or an explicit `cancel`.
+- **The bulkhead is per process.** With four instances the effective limit is four times the
+  configured one. The shared token bucket below fixes this for request rate; concurrency in flight
+  is still counted per instance.
+
+## Shared rate limiting
+
+A bulkhead protects one process. When four instances sit behind a load balancer, four independent
+slot pools let four times the intended traffic through. The shared limiter closes that gap by
+keeping one token bucket per backend namespace in Redis:
+
+```yaml
+mcp:
+  gateway:
+    rate-limit:
+      enabled: true
+      capacity: 100           # burst
+      refill-per-second: 50   # sustained
+      key-prefix: "mcp:gateway:rate:"
+      fail-open: true         # when Redis is unreachable
+      timeout-ms: 100         # budget for one check
+```
+
+The bucket is checked before the local bulkhead, because a shared budget should apply even to the
+instance that happens to have a free slot. A call without a token gets the same shape as a shed
+call — HTTP 429, JSON-RPC `-32000`, `Retry-After` — but `error.data.reason` is `rate_limit` instead
+of `concurrency`, and the retry hint comes from the bucket rather than a fixed second.
+
+Two details make the bucket correct rather than approximately correct:
+
+- **Refill and deduction are one Lua script.** Redis runs a script atomically, so two instances can
+  never both read "one token left" and both spend it.
+- **The clock comes from Redis `TIME`.** Deriving elapsed time from each instance's wall clock would
+  let a host with a fast clock mint tokens, which is exactly the failure a shared limiter exists to
+  prevent.
+
+If Redis is unreachable the gateway does not take itself down with it. `fail-open: true` lets calls
+through and increments `mcp.gateway.rate_limit.errors`; `fail-open: false` rejects them with a
+one-second hint. Denials are counted per backend in `mcp.gateway.rate_limit.denied`, both visible
+through actuator when Micrometer is present.
+
+The check itself is bounded by `timeout-ms`. Relying on the Redis client's command timeout is not
+enough: Lettuce defaults to 60 seconds, so a dead Redis would stall every tool call for a minute
+before the failure policy could apply — the bucket would outlast the call deadline it sits in front
+of. The limiter runs the script on a virtual thread and abandons the wait at the budget; the
+abandoned command finishes on its own and its result is dropped.
+
+Two consequences follow from fail-open, and `mcp-app` is configured for both:
+
+- **The Redis health indicator is off.** Boot would report the instance DOWN when Redis is
+  unreachable, and a load balancer would drain it — exactly the outage fail-open exists to avoid.
+  The `mcp.gateway.rate_limit.errors` counter is the alert instead.
+- **The first check after startup pays the connection handshake.** On a cold client that can exceed
+  `timeout-ms`, so the first call fails open and the connection completes in the background; every
+  later check is a single round trip.
+
+The Redis implementation lives in the starter behind `@ConditionalOnClass`, so the core and the
+starter stay dependency-free unless the app supplies `spring-boot-starter-data-redis`. Enabling the
+limiter without that dependency fails at startup instead of silently running unlimited.
+
+## Load testing
+
+`mcp-loadtest` is a closed-loop load generator: one virtual thread per simulated client, and each
+client waits for its reply before sending the next call. It has no dependencies on the gateway on
+purpose. If it shared a thread pool, a serializer or a client library with the server, the numbers
+would describe the harness as much as the gateway.
+
+```bash
+mvn -pl mcp-loadtest package
+java -jar mcp-loadtest/target/mcp-loadtest-0.1.0-SNAPSHOT.jar \
+  --url http://127.0.0.1:8931/mcp \
+  --concurrency 32 --duration 10 --think-ms 50 \
+  --tool compute_slow_sum --args '{"n":5}'
+```
+
+The demo backend's `compute_slow_sum` sleeps 20 ms per step, so `n=5` costs about 100 ms per call.
+That predictability matters: `SELECT 1` finishes in a millisecond, so the bulkhead never fills and
+every mode looks identical.
+
+`--url` is repeatable and targets are used round-robin, which is how two instances behind one
+bucket are exercised. `--requests N` replaces a duration. `--think-ms` models an agent thinking
+between calls; at zero a rejected client retries immediately and the 429 counts measure the
+generator's spin rate more than the gateway's capacity.
+
+Three runs make the admission-control modes comparable:
+
+| Mode | Configuration |
+|---|---|
+| none | `--mcp.gateway.max-concurrent-calls-per-backend=0`, rate limit off |
+| bulkhead | default `max-concurrent-calls-per-backend=16`, rate limit off |
+| shared bucket | rate limit on, two instances, one `--url` each |
+
+Read `ok ... goodput` first: in the bulkhead run it plateaus near `slots / call duration` and does
+not grow with `--concurrency`. The rest of the attempts land in `429 concurrency`. In the shared
+bucket run the aggregate goodput stays near the configured `capacity` even though the load is split
+across instances, which is the property a per-process semaphore cannot provide. Latency is reported
+separately for completed calls and for 429s, because mixing them makes a workload that is mostly
+rejections look fast.
+
 ## Testing
 
-`mvn verify` runs 59 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
-the same command on every push against JDK 21, which is the release target rather than the local JDK.
+`mvn verify` runs 83 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
+the same command on every push against JDK 21, which is the release target rather than the local JDK,
+with a Redis service so the shared-limiter tests run there too.
 
 | Module | Line coverage | What the tests are for |
 |---|---|---|
-| `mcp-core` | 86% | protocol constants, the engine's header and `_meta` validation, MRTR round trips, `requestState` signing, the three catalogs |
-| `mcp-backends` | 79% | S3 adapter (unit and against SeaweedFS), DuckDB guard, truncation, catalog and error shaping |
-| `mcp-spring-boot-starter` | 75% | the HTTP endpoint over a real port: status codes, SSE switch, actuator aggregation |
+| `mcp-core` | 86% | protocol constants, the engine's header and `_meta` validation, MRTR round trips, `requestState` signing, the three catalogs, bulkheads and deadlines |
+| `mcp-backends` | 62% | S3 adapter (unit, plus integration against SeaweedFS when `MCP_S3_ENDPOINT` is set — the three skipped here), DuckDB guard, truncation, catalog and error shaping |
+| `mcp-spring-boot-starter` | 70% | the HTTP endpoint over a real port: status codes, SSE switch, 429 with `Retry-After`, the Redis limiter's scripts and failure policies, actuator aggregation |
 
 Two exclusions are deliberate. `mcp-core` skips `devtools/` and `conformance/` in the report: the dev
 server is a harness no test drives, and the conformance fixtures exist to be called over the wire by
@@ -195,24 +321,33 @@ npx @modelcontextprotocol/conformance@alpha server \
   --url http://127.0.0.1:8931/mcp --suite draft
 ```
 
-Current result: **85 passed, 6 failed** across the draft server scenarios.
+Current result: **96 passed, 0 failed** across the draft server scenarios.
 
 | Scenario | Result |
 |---|---|
 | `server-stateless` | 25 / 25 |
 | `http-header-validation` | 14 / 14 |
-| `input-required-result-*` (13 scenarios) | 12 fully pass; `non-tool-request` is 1 / 2 |
+| `http-custom-header-server-validation` | 10 / 10 |
+| `input-required-result-*` (14 scenarios) | 35 / 35 |
 | `sep-2164-resource-not-found` | 4 / 4 |
 | `caching` | 8 / 8 |
-| `http-custom-header-server-validation` | 1 / 6 |
 
-The six remaining failures are two features rather than protocol errors. Five belong to the
-`x-mcp-header` extension, which is not implemented. The sixth is `prompts/get` returning an
-`input_required` result: multi-round requests are implemented for `tools/call` only, and `PromptResult`
-has no shape for asking the client anything.
+Two pieces of the revision are easy to miss because they only show up on the HTTP layer:
+
+- **Parameter mirrors (`x-mcp-header`).** A tool can annotate one string argument with
+  `"x-mcp-header": "region"`, and clients then repeat that argument in `Mcp-Param-region`. The engine
+  compares the two before the handler runs: a disagreement, or a missing header while the body carries
+  the value, is `-32020` with HTTP 400. Wrapped values (`=?base64?...?=`) are Base64 and must be
+  correctly padded; unwrapped values are compared literally. The check lives in
+  `McpServerEngine.validateParameterHeaders`.
+- **MRTR is not tool-only.** `prompts/get` can return `input_required` too, with its own signed
+  `requestState`, and the client's answers arrive on the next `prompts/get` as `inputResponses`.
+  `PromptResult` mirrors `ToolResult`'s two shapes, and handlers receive a `PromptContext` instead of
+  a bare arguments object so they can tell a first round from a resumption.
 
 The `test_*` fixtures the suite drives live in `mcp-core/.../conformance/` and are registered only
-when `mcp.gateway.conformance-fixtures` is true.
+when `mcp.gateway.conformance-fixtures` is true. Their tool and prompt names are published without
+the namespace prefix, which is what `BackendAdapter.prefixedNames()` opts out of.
 
 ## Resources and prompts
 
@@ -225,7 +360,7 @@ implements nothing extra.
 | `resources/templates/list` | the same for RFC 6570 templates |
 | `resources/read` | splits the uri, routes to the owning adapter, shapes text or blob contents |
 | `prompts/list` | publishes prompt names prefixed with the namespace, arguments included |
-| `prompts/get` | validates required arguments, then routes to the adapter to render messages |
+| `prompts/get` | validates required arguments, then routes to the adapter to render messages or ask for input |
 
 Four decisions are visible in the wire format:
 
@@ -241,6 +376,9 @@ Four decisions are visible in the wire format:
   empty file.
 - **Prompt arguments are validated in the engine.** Required arguments are declared in
   `PromptDefinition`, so omitting one is rejected with `-32602` before the adapter runs.
+- **Prompt names can skip the prefix.** `prompts/get` addresses a prompt by name alone, so the
+  namespace has to go somewhere; it is prefixed by default, and `prefixedNames()` is the same opt-out
+  tools use when their names are already globally unique.
 
 ```java
 @Override public List<ResourceDefinition> resources() {
@@ -325,6 +463,73 @@ call that tells the model to run `list_tables` first, rather than a driver error
 | `mcp.gateway.duckdb.max-rows` | 200 | hard cap per call |
 | `mcp.gateway.duckdb.timeout-seconds` | 5 | passed to `setQueryTimeout` when supported |
 
+## Spark backend
+
+`SparkQueryAdapter` exposes `spark_run_sql` over `spark-submit`. Spark cannot be embedded in the
+gateway: it brings its own Guava, Netty and Jackson, and those versions collide with the gateway's,
+so a shared JVM fails at class load or at the first query. A subprocess has a second benefit — when
+the gateway's deadline expires it can kill the whole process tree, which a JDBC driver cannot offer.
+
+The price is startup. Every call starts a JVM and a Spark session; a one-row query measured about
+9 s end to end on a laptop, of which Spark itself was about 5. So the adapter:
+
+- runs at most one driver at a time (`max-parallel-jobs: 1`); a call arriving while the slot is
+  taken fails with "retry in a few seconds" rather than queueing behind a slow job;
+- caps the result at `max-rows` (50 by default, 500 hard) and reports `truncated`;
+- kills the process tree on timeout, so a cancelled query does not keep a core busy;
+- keeps `health()` to a presence check — starting Spark to prove it works would cost seconds on
+  every actuator poll.
+
+The statement goes through the same `SqlGuard` as the DuckDB backend: one read-only statement,
+literals and comments stripped before the leading-keyword check.
+
+### Running it
+
+Off by default, because it needs a local Spark installation. On Windows the PySpark launcher also
+needs `HADOOP_HOME` with winutils in `bin` on `PATH`, and `PYSPARK_PYTHON` pointing at a real
+interpreter (the Microsoft Store `python.exe` stub exits with code 49 and no output).
+
+```bash
+MCP_SPARK_ENABLED=true \
+MCP_SPARK_SUBMIT=/path/to/spark/bin/spark-submit \
+MCP_SPARK_PYTHON=/path/to/python \
+MCP_SPARK_SPARK_HOME=/path/to/pyspark \
+MCP_SPARK_HADOOP_HOME=/path/to/hadoop \
+java -jar mcp-app/target/mcp-app-0.1.0-SNAPSHOT.jar
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8931/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/call' \
+  -H 'Mcp-Name: spark_run_sql' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spark_run_sql","arguments":{"sql":"SELECT id, id * 10 AS ten FROM range(5)"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+The reply is `5 row(s), 2 column(s)` with the rows in `structuredContent`.
+
+### One Windows trap worth knowing
+
+Spark's launcher re-encodes its command-line arguments through the console code page, so an absolute
+script path containing non-ASCII characters reaches the JVM as `?` and the launch dies in
+`File.getCanonicalPath` with `Bad pathname`. That includes the default temp directory of any user
+whose Windows account name is not ASCII. The adapter therefore never puts the path on the command
+line: it sets the child's working directory (which Windows passes as Unicode) and passes bare file
+names. `jobFilesArePassedAsBareNamesSoTheCommandLineStaysAscii` pins the behaviour down.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `MCP_SPARK_ENABLED` | `false` | adds the backend |
+| `MCP_SPARK_SUBMIT` | required | `spark-submit` or `spark-submit.cmd` |
+| `MCP_SPARK_MASTER` | `local[2]` | Spark master URL |
+| `MCP_SPARK_PYTHON` | inherit | exported as `PYSPARK_PYTHON` |
+| `MCP_SPARK_SPARK_HOME` | inherit | exported as `SPARK_HOME` |
+| `MCP_SPARK_HADOOP_HOME` | inherit | exported as `HADOOP_HOME`, `bin` prepended to `PATH` |
+| `mcp.gateway.spark.max-rows` | 50 | cap per call, 500 hard |
+| `mcp.gateway.spark.timeout-seconds` | 60 | driver limit; `call-timeout-ms` still applies on top |
+| `mcp.gateway.spark.max-parallel-jobs` | 1 | concurrent drivers on this host |
+
 ## Using it from Spring Boot
 
 Depend on the starter, declare your adapters as beans, and the endpoint appears:
@@ -405,16 +610,18 @@ mcp-gateway/
 │       ├── devtools/          JDK-HttpServer transport + main
 │       ├── conformance/       diagnostic fixtures for the official test suite
 │       └── demo/              three in-memory sample adapters
-├── mcp-backends/              real adapters: S3StorageAdapter (any S3 endpoint), DuckDBQueryAdapter
+├── mcp-backends/              real adapters: S3StorageAdapter (any S3 endpoint), DuckDBQueryAdapter,
+│                              SparkQueryAdapter, shared SqlGuard
 ├── mcp-spring-boot-starter/   autoconfiguration, POST endpoint, actuator health contributor
 ├── mcp-app/                   runnable sample: the starter with demo and real adapters
+├── mcp-loadtest/              dependency-free closed-loop load generator
 ├── docker/                    nginx config, bucket bootstrap, multi-instance demo
 ├── docker-compose.yml         gateway plus S3-compatible storage in one command
 └── docker-compose.multi.yml   two instances behind nginx, for the failover experiment
 ```
 
 `mcp-core` has no Spring dependency, so the engine and SPI work in any Java runtime. The starter is one
-thin binding; the next adapter behind the same SPI is a Spark backend.
+thin binding; adapters behind the same SPI need nothing else.
 
 ## Notes on two deliberate choices
 
@@ -432,9 +639,7 @@ instead of two that drift apart.
 
 ## Roadmap
 
-- Adapters: Spark and HBase behind the same SPI
-- `prompts/get` returning `input_required`, so multi-round prompts work as `tools/call` does
-- The `x-mcp-header` extension, which the last five conformance checks cover
+- Adapters: HBase behind the same SPI
 - `subscriptions/listen`, tasks extension, OAuth
 
 ## License
