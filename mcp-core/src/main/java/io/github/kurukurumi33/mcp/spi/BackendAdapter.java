@@ -1,7 +1,5 @@
 package io.github.kurukurumi33.mcp.spi;
 
-import tools.jackson.databind.JsonNode;
-
 import java.util.List;
 import java.util.Optional;
 
@@ -43,14 +41,14 @@ public interface BackendAdapter {
     }
 
     /**
-     * Whether tool names are published as {@code namespace_name}.
+     * Whether tool and prompt names are published as {@code namespace_name}.
      *
      * <p>True for ordinary backends, because two backends both publishing {@code list} must not
-     * collide on one flat catalog. A backend whose tool names are already globally unique by
-     * contract — an existing MCP server being passed through, or the conformance fixtures — can
-     * opt out and keep its names exactly as they are.
+     * collide on one flat catalog. A backend whose names are already globally unique by contract —
+     * an existing MCP server being passed through, or the conformance fixtures — can opt out and
+     * keep its names exactly as they are.
      */
-    default boolean prefixedToolNames() {
+    default boolean prefixedNames() {
         return true;
     }
 
@@ -109,13 +107,17 @@ public interface BackendAdapter {
     }
 
     /**
-     * Renders one prompt into messages, or returns empty when no prompt by that name exists.
+     * Renders one prompt into messages, asks for input, or returns empty when no prompt by that name
+     * exists.
+     *
+     * <p>A prompt may return {@link PromptResult#inputRequired} and be resumed with the client's
+     * answers, exactly like a tool; the second round arrives as a new request whose
+     * {@link PromptContext#isResumption()} is true.
      *
      * @param promptName unqualified name, as returned from {@link #prompts()}
-     * @param arguments  the caller's arguments, possibly empty but never null; an adapter decides
-     *                   which ones are required
+     * @param context    arguments, answers to a previous round, and the signed continuation state
      */
-    default Optional<PromptResult> getPrompt(String promptName, JsonNode arguments) {
+    default Optional<PromptResult> getPrompt(String promptName, PromptContext context) {
         return Optional.empty();
     }
 

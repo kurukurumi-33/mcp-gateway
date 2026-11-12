@@ -13,7 +13,7 @@ public record RegisteredTool(BackendAdapter adapter, ToolDefinition definition) 
 
     /** The name clients see, e.g. {@code storage_list_files}. */
     public String qualifiedName() {
-        return adapter.prefixedToolNames()
+        return adapter.prefixedNames()
                 ? adapter.namespace() + "_" + definition.name()
                 : definition.name();
     }

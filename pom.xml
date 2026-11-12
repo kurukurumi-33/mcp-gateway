@@ -25,6 +25,7 @@
     <module>mcp-backends</module>
     <module>mcp-spring-boot-starter</module>
     <module>mcp-app</module>
+    <module>mcp-loadtest</module>
   </modules>
 
   <properties>

@@ -1,5 +1,6 @@
 package io.github.kurukurumi33.mcp.server;
 
+import io.github.kurukurumi33.mcp.conformance.ConformanceAdapter;
 import io.github.kurukurumi33.mcp.demo.ComputeAdapter;
 import io.github.kurukurumi33.mcp.demo.StorageAdapter;
 import io.github.kurukurumi33.mcp.demo.SystemAdapter;
@@ -17,12 +18,18 @@ import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -44,6 +51,15 @@ class McpServerEngineTest {
         return engine(List.of(new SystemAdapter(), new StorageAdapter(), new ComputeAdapter()));
     }
 
+    private McpServerEngine engine(List<BackendAdapter> adapters, AdmissionControl admissionControl) {
+        return new McpServerEngine(
+                new GatewayRegistry(adapters),
+                RequestStateCodec.random(),
+                new McpServerEngine.ServerInfo("mcp-gateway-test", "0.1.0"),
+                60_000L,
+                admissionControl);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private McpRequest request(String method, ObjectNode params, String nameHeader) {
@@ -52,7 +68,15 @@ class McpServerEngineTest {
         if (params != null) {
             body.set("params", params);
         }
-        return new McpRequest(McpProtocol.PROTOCOL_VERSION, method, nameHeader, body);
+        return McpRequest.of(McpProtocol.PROTOCOL_VERSION, method, nameHeader, body);
+    }
+
+    private McpRequest request(String method, ObjectNode params, String nameHeader,
+                               Map<String, String> extraHeaders) {
+        McpRequest base = request(method, params, nameHeader);
+        Map<String, String> headers = new LinkedHashMap<>(base.headers());
+        headers.putAll(extraHeaders);
+        return new McpRequest(headers, base.body());
     }
 
     private ObjectNode params() {
@@ -273,7 +297,7 @@ class McpServerEngineTest {
     @Test
     @DisplayName("7. an unsupported protocol version is rejected with -32022")
     void unsupportedVersion() {
-        McpRequest request = new McpRequest("2019-01-01", McpProtocol.METHOD_TOOLS_LIST, null,
+        McpRequest request = McpRequest.of("2019-01-01", McpProtocol.METHOD_TOOLS_LIST, null,
                 Json.obj().put("jsonrpc", "2.0").put("id", 1)
                         .put("method", McpProtocol.METHOD_TOOLS_LIST).set("params", params()));
 
@@ -286,7 +310,7 @@ class McpServerEngineTest {
     @Test
     @DisplayName("8. a missing MCP-Protocol-Version header is a header mismatch, not a default")
     void missingVersionHeader() {
-        McpRequest request = new McpRequest(null, McpProtocol.METHOD_TOOLS_LIST, null,
+        McpRequest request = McpRequest.of(null, McpProtocol.METHOD_TOOLS_LIST, null,
                 Json.obj().put("jsonrpc", "2.0").put("id", 1)
                         .put("method", McpProtocol.METHOD_TOOLS_LIST).set("params", params()));
 
@@ -299,7 +323,7 @@ class McpServerEngineTest {
     @Test
     @DisplayName("8b. a request without _meta is invalid, not version-less")
     void missingMeta() {
-        McpRequest request = new McpRequest(McpProtocol.PROTOCOL_VERSION,
+        McpRequest request = McpRequest.of(McpProtocol.PROTOCOL_VERSION,
                 McpProtocol.METHOD_TOOLS_LIST, null,
                 Json.obj().put("jsonrpc", "2.0").put("id", 1)
                         .put("method", McpProtocol.METHOD_TOOLS_LIST).set("params", Json.obj()));
@@ -535,5 +559,309 @@ class McpServerEngineTest {
 
         assertEquals(400, result.httpStatus());
         assertEquals(name, result.terminal().path("error").path("data").path("name").asString());
+    }
+
+    // ---------------------------------------------------------------- SEP-2243 / SEP-2322
+
+    private McpServerEngine conformanceEngine() {
+        return engine(List.of(new ConformanceAdapter()));
+    }
+
+    private EngineResult callCustomHeader(String bodyRegion, Map<String, String> headers) {
+        ObjectNode params = params().put("name", "test_custom_headers")
+                .set("arguments", Json.obj().put("region", bodyRegion));
+        return conformanceEngine().handle(request(McpProtocol.METHOD_TOOLS_CALL,
+                params, "test_custom_headers", headers));
+    }
+
+    @Test
+    @DisplayName("19. a mirrored header disagreeing with the body is rejected with -32020")
+    void mirroredHeaderMismatch() {
+        EngineResult result = callCustomHeader("eu-west-1", Map.of("Mcp-Param-region", "us-east-1"));
+
+        assertEquals(400, result.httpStatus());
+        assertEquals(McpProtocol.HEADER_MISMATCH, errorCode(result.terminal()));
+    }
+
+    @Test
+    @DisplayName("19b. omitting a mirrored header while the body carries the value is rejected")
+    void mirroredHeaderMissing() {
+        EngineResult result = callCustomHeader("eu-west-1", Map.of());
+
+        assertEquals(400, result.httpStatus());
+        assertEquals(McpProtocol.HEADER_MISMATCH, errorCode(result.terminal()));
+    }
+
+    @Test
+    @DisplayName("19c. a Base64-wrapped header is decoded before it is compared")
+    void mirroredHeaderBase64() {
+        // "Hello" in padded Base64, which is the only form the extension accepts.
+        EngineResult result = callCustomHeader("Hello", Map.of("Mcp-Param-region", "=?base64?SGVsbG8=?="));
+
+        assertEquals(200, result.httpStatus());
+        assertEquals("header matched: Hello",
+                resultOf(result.terminal()).path("content").get(0).path("text").asString());
+    }
+
+    @Test
+    @DisplayName("19d. Base64 without the required padding is rejected, not silently decoded")
+    void mirroredHeaderUnpaddedBase64() {
+        EngineResult result = callCustomHeader("Hello", Map.of("Mcp-Param-region", "=?base64?SGVsbG8?="));
+
+        assertEquals(400, result.httpStatus());
+        assertEquals(McpProtocol.HEADER_MISMATCH, errorCode(result.terminal()));
+    }
+
+    @Test
+    @DisplayName("20. prompts/get can ask for input and complete on the next round")
+    void promptInputRequired() {
+        String name = "test_input_required_result_prompt";
+        McpServerEngine engine = conformanceEngine();
+
+        JsonNode first = resultOf(engine.handle(
+                request(McpProtocol.METHOD_PROMPTS_GET, params().put("name", name), name)).terminal());
+
+        assertEquals(McpProtocol.RESULT_TYPE_INPUT_REQUIRED, first.path("resultType").asString());
+        assertEquals("elicitation/create",
+                first.path("inputRequests").path("user_context").path("method").asString());
+        String state = first.path("requestState").asString();
+        assertFalse(state.isBlank(), "the engine must sign the continuation state");
+
+        ObjectNode second = params().put("name", name).put("requestState", state)
+                .set("inputResponses", Json.obj().set("user_context", Json.obj()
+                        .put("action", "accept")
+                        .set("content", Json.obj().put("context", "incident notes"))));
+
+        JsonNode complete = resultOf(engine.handle(
+                request(McpProtocol.METHOD_PROMPTS_GET, second, name)).terminal());
+
+        assertEquals(McpProtocol.RESULT_TYPE_COMPLETE, complete.path("resultType").asString());
+        assertEquals("user", complete.path("messages").get(0).path("role").asString());
+        assertTrue(complete.path("messages").get(0).path("content").path("text").asString()
+                .contains("incident notes"));
+    }
+
+    // ---------------------------------------------------------------- admission control
+
+    @Test
+    @DisplayName("21. a call that cannot get a backend slot is shed with 429 and Retry-After")
+    void bulkheadRejectsWhenFull() throws Exception {
+        GateAdapter adapter = new GateAdapter();
+        McpServerEngine engine = engine(List.of(adapter), AdmissionControl.of(1, 0, 0, 0));
+
+        AtomicReference<EngineResult> first = new AtomicReference<>();
+        Thread worker = Thread.ofVirtual().start(() -> first.set(engine.handle(request(
+                McpProtocol.METHOD_TOOLS_CALL, params().put("name", "gate_hold"), "gate_hold"))));
+
+        assertTrue(adapter.entered.await(5, TimeUnit.SECONDS), "the first call should reach the backend");
+        try {
+            EngineResult second = engine.handle(request(
+                    McpProtocol.METHOD_TOOLS_CALL, params().put("name", "gate_hold"), "gate_hold"));
+
+            assertEquals(429, second.httpStatus());
+            assertEquals(McpProtocol.SERVER_BUSY, errorCode(second.terminal()));
+            assertEquals("1", second.headers().get("Retry-After"));
+            assertEquals(1, adapter.executions.get(), "the shed call must not reach the backend");
+        } finally {
+            adapter.releaseGate.countDown();
+            worker.join(TimeUnit.SECONDS.toMillis(5));
+        }
+
+        assertEquals(200, first.get().httpStatus());
+    }
+
+    @Test
+    @DisplayName("22. a call that outlives the deadline is 504 and then gives its slot back")
+    void callDeadline() throws InterruptedException {
+        SleepOnceAdapter adapter = new SleepOnceAdapter();
+        McpServerEngine engine = engine(List.of(adapter), AdmissionControl.of(1, 0, 0, 100));
+
+        long started = System.nanoTime();
+        EngineResult timedOut = engine.handle(request(McpProtocol.METHOD_TOOLS_CALL,
+                params().put("name", "slow_sleep_once"), "slow_sleep_once"));
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertEquals(504, timedOut.httpStatus());
+        assertEquals(McpProtocol.BACKEND_TIMEOUT, errorCode(timedOut.terminal()));
+        assertEquals(100, timedOut.terminal().path("error").path("data").path("timeoutMs").asInt());
+        assertTrue(elapsedMs < 5_000, "the gateway must stop waiting at the deadline; took " + elapsedMs + " ms");
+
+        // The interrupted worker releases its permit in a finally block; poll rather than assume
+        // the release landed before this thread woke up.
+        EngineResult retry = null;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            retry = engine.handle(request(McpProtocol.METHOD_TOOLS_CALL,
+                    params().put("name", "slow_sleep_once"), "slow_sleep_once"));
+            if (retry.httpStatus() != 429) {
+                break;
+            }
+            Thread.sleep(10);
+        }
+
+        assertNotNull(retry);
+        assertEquals(200, retry.httpStatus());
+        assertEquals("fast",
+                resultOf(retry.terminal()).path("content").get(0).path("text").asString());
+    }
+
+    @Test
+    @DisplayName("23. a configured queue let a caller wait for the slot instead of shedding it")
+    void queueWaitGrantsPermit() throws Exception {
+        GateAdapter adapter = new GateAdapter();
+        McpServerEngine engine = engine(List.of(adapter), AdmissionControl.of(1, 1, 5_000, 0));
+
+        AtomicReference<EngineResult> first = new AtomicReference<>();
+        Thread holder = Thread.ofVirtual().start(() -> first.set(engine.handle(request(
+                McpProtocol.METHOD_TOOLS_CALL, params().put("name", "gate_hold"), "gate_hold"))));
+        assertTrue(adapter.entered.await(5, TimeUnit.SECONDS), "the first call should reach the backend");
+
+        AtomicReference<EngineResult> waiter = new AtomicReference<>();
+        Thread queued = Thread.ofVirtual().start(() -> waiter.set(engine.handle(request(
+                McpProtocol.METHOD_TOOLS_CALL, params().put("name", "gate_hold"), "gate_hold"))));
+
+        Thread.sleep(100);
+        assertNull(waiter.get(), "the second call must still be waiting for the only slot");
+
+        adapter.releaseGate.countDown();
+        holder.join(TimeUnit.SECONDS.toMillis(5));
+        queued.join(TimeUnit.SECONDS.toMillis(5));
+
+        assertEquals(200, first.get().httpStatus());
+        assertNotNull(waiter.get());
+        assertEquals(200, waiter.get().httpStatus());
+        assertEquals(2, adapter.executions.get());
+    }
+
+    @Test
+    @DisplayName("24. with no queue capacity a waiter is shed even when a wait is configured")
+    void queueCapacityZeroSheds() throws Exception {
+        GateAdapter adapter = new GateAdapter();
+        McpServerEngine engine = engine(List.of(adapter), AdmissionControl.of(1, 0, 5_000, 0));
+
+        AtomicReference<EngineResult> first = new AtomicReference<>();
+        Thread holder = Thread.ofVirtual().start(() -> first.set(engine.handle(request(
+                McpProtocol.METHOD_TOOLS_CALL, params().put("name", "gate_hold"), "gate_hold"))));
+        assertTrue(adapter.entered.await(5, TimeUnit.SECONDS), "the first call should reach the backend");
+        try {
+            EngineResult second = engine.handle(request(
+                    McpProtocol.METHOD_TOOLS_CALL, params().put("name", "gate_hold"), "gate_hold"));
+
+            assertEquals(429, second.httpStatus());
+            assertEquals(McpProtocol.SERVER_BUSY, errorCode(second.terminal()));
+        } finally {
+            adapter.releaseGate.countDown();
+            holder.join(TimeUnit.SECONDS.toMillis(5));
+        }
+        assertEquals(200, first.get().httpStatus());
+    }
+
+    @Test
+    @DisplayName("25. the shared limiter can shed a call before it reaches the backend")
+    void sharedLimiterDenies() {
+        GateAdapter adapter = new GateAdapter();
+        CallLimiter limiter = backend -> CallLimiter.Decision.deny(2_500);
+        McpServerEngine engine = engine(List.of(adapter), AdmissionControl.of(0, 0, 0, 0, limiter));
+
+        EngineResult result = engine.handle(request(McpProtocol.METHOD_TOOLS_CALL,
+                params().put("name", "gate_hold"), "gate_hold"));
+
+        assertEquals(429, result.httpStatus());
+        assertEquals(McpProtocol.SERVER_BUSY, errorCode(result.terminal()));
+        assertEquals("3", result.headers().get("Retry-After"), "2500 ms rounds up to 3 seconds");
+        assertEquals("rate_limit",
+                result.terminal().path("error").path("data").path("reason").asString());
+        assertEquals(0, adapter.executions.get(), "a rate-limited call must not reach the backend");
+    }
+
+    @Test
+    @DisplayName("26. a limiter that allows leaves the call untouched")
+    void sharedLimiterAllows() {
+        GateAdapter adapter = new GateAdapter();
+        adapter.releaseGate.countDown();
+        McpServerEngine engine = engine(List.of(adapter),
+                AdmissionControl.of(0, 0, 0, 0, backend -> CallLimiter.Decision.allow()));
+
+        EngineResult result = engine.handle(request(McpProtocol.METHOD_TOOLS_CALL,
+                params().put("name", "gate_hold"), "gate_hold"));
+
+        assertEquals(200, result.httpStatus());
+        assertEquals(1, adapter.executions.get());
+    }
+
+    /** Blocks every call until the test opens the gate, so the bulkhead can be observed full. */
+    private static final class GateAdapter implements BackendAdapter {
+
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch releaseGate = new CountDownLatch(1);
+        private final AtomicInteger executions = new AtomicInteger();
+
+        @Override
+        public String namespace() {
+            return "gate";
+        }
+
+        @Override
+        public String description() {
+            return "holds calls until the test releases them";
+        }
+
+        @Override
+        public List<ToolDefinition> tools() {
+            return List.of(ToolDefinition.builder("hold")
+                    .description("Blocks until the test opens the gate")
+                    .build());
+        }
+
+        @Override
+        public ToolResult execute(String toolName, RequestContext context) {
+            executions.incrementAndGet();
+            entered.countDown();
+            try {
+                if (!releaseGate.await(10, TimeUnit.SECONDS)) {
+                    return ToolResult.error("the test never released the gate");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+            return ToolResult.text("released");
+        }
+    }
+
+    /** Sleeps on the first call and answers instantly afterwards. */
+    private static final class SleepOnceAdapter implements BackendAdapter {
+
+        private final AtomicInteger calls = new AtomicInteger();
+
+        @Override
+        public String namespace() {
+            return "slow";
+        }
+
+        @Override
+        public String description() {
+            return "sleeps once, then is fast";
+        }
+
+        @Override
+        public List<ToolDefinition> tools() {
+            return List.of(ToolDefinition.builder("sleep_once")
+                    .description("Takes longer than the deadline on its first call")
+                    .build());
+        }
+
+        @Override
+        public ToolResult execute(String toolName, RequestContext context) {
+            if (calls.incrementAndGet() == 1) {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            }
+            return ToolResult.text("fast");
+        }
     }
 }

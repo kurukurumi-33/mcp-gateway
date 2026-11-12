@@ -3,6 +3,7 @@ package io.github.kurukurumi33.mcp.server;
 import tools.jackson.databind.JsonNode;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The engine's answer to one request, expressed in transport-neutral terms.
@@ -14,11 +15,18 @@ import java.util.List;
  * @param httpStatus status the transport should send
  * @param sse        true when the messages must be delivered as a stream rather than one body
  * @param messages   zero or more notifications followed by the final JSON-RPC message
+ * @param headers    extra response headers, such as {@code Retry-After} on a shed call
  */
-public record EngineResult(int httpStatus, boolean sse, List<JsonNode> messages) {
+public record EngineResult(int httpStatus, boolean sse, List<JsonNode> messages,
+                           Map<String, String> headers) {
 
     public EngineResult {
         messages = List.copyOf(messages);
+        headers = Map.copyOf(headers);
+    }
+
+    public EngineResult(int httpStatus, boolean sse, List<JsonNode> messages) {
+        this(httpStatus, sse, messages, Map.of());
     }
 
     public static EngineResult json(JsonNode message) {
@@ -27,6 +35,10 @@ public record EngineResult(int httpStatus, boolean sse, List<JsonNode> messages)
 
     public static EngineResult json(JsonNode message, int httpStatus) {
         return new EngineResult(httpStatus, false, List.of(message));
+    }
+
+    public static EngineResult json(JsonNode message, int httpStatus, Map<String, String> headers) {
+        return new EngineResult(httpStatus, false, List.of(message), headers);
     }
 
     public static EngineResult stream(List<JsonNode> messages) {

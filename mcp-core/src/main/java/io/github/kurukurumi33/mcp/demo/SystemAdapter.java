@@ -3,6 +3,7 @@ package io.github.kurukurumi33.mcp.demo;
 import io.github.kurukurumi33.mcp.protocol.Json;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
 import io.github.kurukurumi33.mcp.spi.PromptArgument;
+import io.github.kurukurumi33.mcp.spi.PromptContext;
 import io.github.kurukurumi33.mcp.spi.PromptDefinition;
 import io.github.kurukurumi33.mcp.spi.PromptResult;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
@@ -73,12 +74,12 @@ public final class SystemAdapter implements BackendAdapter {
     }
 
     @Override
-    public Optional<PromptResult> getPrompt(String promptName, JsonNode arguments) {
+    public Optional<PromptResult> getPrompt(String promptName, PromptContext context) {
         if (!"explain_backend".equals(promptName)) {
             return Optional.empty();
         }
-        String namespace = arguments.path("namespace").asString("");
-        return Optional.of(new PromptResult(
+        String namespace = context.stringArg("namespace");
+        return Optional.of(PromptResult.of(
                 "Walkthrough of the '" + namespace + "' backend",
                 List.of(PromptResult.user(
                         "Explain how the MCP gateway routes calls to the '" + namespace

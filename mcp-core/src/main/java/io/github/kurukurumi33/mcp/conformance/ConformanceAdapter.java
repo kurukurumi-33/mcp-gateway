@@ -5,6 +5,9 @@ import io.github.kurukurumi33.mcp.protocol.McpException;
 import io.github.kurukurumi33.mcp.spi.BackendAdapter;
 import io.github.kurukurumi33.mcp.spi.InputRequest;
 import io.github.kurukurumi33.mcp.spi.InputResponse;
+import io.github.kurukurumi33.mcp.spi.PromptContext;
+import io.github.kurukurumi33.mcp.spi.PromptDefinition;
+import io.github.kurukurumi33.mcp.spi.PromptResult;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
 import io.github.kurukurumi33.mcp.spi.ToolDefinition;
 import io.github.kurukurumi33.mcp.spi.ToolResult;
@@ -13,6 +16,7 @@ import tools.jackson.databind.JsonNode;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Diagnostic fixtures the official conformance suite drives the server with.
@@ -34,7 +38,7 @@ public final class ConformanceAdapter implements BackendAdapter {
     }
 
     @Override
-    public boolean prefixedToolNames() {
+    public boolean prefixedNames() {
         return false;
     }
 
@@ -67,8 +71,18 @@ public final class ConformanceAdapter implements BackendAdapter {
                 fixture("test_input_required_result_multi_round",
                         "Requires three rounds, two of them asking for input."),
                 fixture("test_input_required_result_capabilities",
-                        "Only asks for the input methods the client declared."));
+                        "Only asks for the input methods the client declared."),
+                ToolDefinition.builder("test_custom_headers")
+                        .description("Declares an argument mirrored into an HTTP header via x-mcp-header.")
+                        .inputSchema(CUSTOM_HEADER_SCHEMA)
+                        .build());
     }
+
+    private static final JsonNode CUSTOM_HEADER_SCHEMA = Json.obj()
+            .put("type", "object")
+            .set("properties", Json.obj().set("region", Json.obj()
+                    .put("type", "string")
+                    .put("x-mcp-header", "region")));
 
     private static ToolDefinition fixture(String name, String description) {
         return ToolDefinition.builder(name).description(description).mrtr(true).build();
@@ -88,8 +102,39 @@ public final class ConformanceAdapter implements BackendAdapter {
             case "test_input_required_result_multiple_inputs" -> multipleInputs(context);
             case "test_input_required_result_multi_round" -> multiRound(context);
             case "test_input_required_result_capabilities" -> capabilities(context);
+            case "test_custom_headers" -> customHeaders(context);
             default -> ToolResult.error("Unknown conformance fixture '" + toolName + "'");
         };
+    }
+
+    // ------------------------------------------------------------------ prompts
+
+    @Override
+    public List<PromptDefinition> prompts() {
+        return List.of(new PromptDefinition("test_input_required_result_prompt",
+                "Asks for context through elicitation before rendering, to show MRTR is not tool-only.",
+                List.of()));
+    }
+
+    @Override
+    public Optional<PromptResult> getPrompt(String promptName, PromptContext context) {
+        if (!"test_input_required_result_prompt".equals(promptName)) {
+            return Optional.empty();
+        }
+        if (!context.isResumption()) {
+            return Optional.of(PromptResult.inputRequired(
+                    Map.of("user_context", InputRequest.elicitation(Json.obj()
+                            .put("message", "What context should the prompt use?")
+                            .set("requestedSchema", Json.obj()
+                                    .put("type", "object")
+                                    .set("properties", Json.obj()
+                                            .set("context", Json.obj().put("type", "string")))
+                                    .set("required", Json.arr().add("context"))))),
+                    null));
+        }
+        String supplied = content(context, "user_context").path("context").asString("unknown");
+        return Optional.of(PromptResult.of("Prompt rendered with the caller's context",
+                List.of(PromptResult.user("Use this context: " + supplied))));
     }
 
     // ------------------------------------------------------------------ fixtures
@@ -234,6 +279,12 @@ public final class ConformanceAdapter implements BackendAdapter {
         return ToolResult.inputRequired(requests, Json.obj().put("fixture", "capabilities"));
     }
 
+    private ToolResult customHeaders(RequestContext context) {
+        // The engine has already compared the mirrored header with this argument; echoing it back
+        // proves the call reached the tool rather than being rejected on the way in.
+        return ToolResult.text("header matched: " + context.stringArg("region"));
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private static InputRequest nameRequest() {
@@ -258,6 +309,14 @@ public final class ConformanceAdapter implements BackendAdapter {
 
     /** The {@code content} of a client response, or an empty object when it did not answer. */
     private static JsonNode content(RequestContext context, String inputId) {
+        InputResponse response = context.input(inputId);
+        if (response == null || response.content() == null) {
+            return Json.obj();
+        }
+        return response.content();
+    }
+
+    private static JsonNode content(PromptContext context, String inputId) {
         InputResponse response = context.input(inputId);
         if (response == null || response.content() == null) {
             return Json.obj();

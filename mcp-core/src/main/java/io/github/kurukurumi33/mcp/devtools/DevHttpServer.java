@@ -14,6 +14,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Minimal Streamable HTTP transport built on the JDK's own server, for local runs and tests only.
@@ -88,14 +90,21 @@ public final class DevHttpServer implements AutoCloseable {
         try (InputStream in = exchange.getRequestBody()) {
             body = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
-        return new McpRequest(
-                exchange.getRequestHeaders().getFirst(McpProtocol.HEADER_PROTOCOL_VERSION),
-                exchange.getRequestHeaders().getFirst(McpProtocol.HEADER_METHOD),
-                exchange.getRequestHeaders().getFirst(McpProtocol.HEADER_NAME),
-                Json.parse(body));
+        return new McpRequest(headerMap(exchange), Json.parse(body));
+    }
+
+    private static Map<String, String> headerMap(HttpExchange exchange) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        exchange.getRequestHeaders().forEach((name, values) -> {
+            if (!values.isEmpty()) {
+                headers.put(name, values.getFirst());
+            }
+        });
+        return headers;
     }
 
     private static void respond(HttpExchange exchange, EngineResult result) throws IOException {
+        result.headers().forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
         if (result.messages().isEmpty()) {
             exchange.sendResponseHeaders(result.httpStatus(), -1);
             return;

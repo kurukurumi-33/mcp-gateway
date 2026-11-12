@@ -1,8 +1,8 @@
 name: CI
 
 # The suite is the contract: every push runs the protocol, transport and backend tests.
-# Integration tests that need an external service (S3) skip themselves when the endpoint is
-# absent, so this workflow stays green on a machine with no storage.
+# Integration tests that need an external service (S3, Redis) skip themselves when the endpoint is
+# absent, so this workflow stays green on a machine with neither.
 on:
   push:
     branches: [ main ]
@@ -26,6 +26,9 @@ jobs:
     # supplies it so the suite runs the adapter against a real S3 implementation rather than
     # leaving the storage paths unexecuted. MinIO was the obvious image here until it pulled its
     # Docker Hub images in 2025; SeaweedFS speaks the same API on the same port style.
+    #
+    # Redis does the same for the rate limiter: the Lua script and the refill behaviour can only be
+    # checked against a real server.
     services:
       seaweedfs:
         image: chrislusf/seaweedfs:latest
@@ -33,6 +36,15 @@ jobs:
           - 8333:8333
         options: >-
           --health-cmd "wget -q -O /dev/null http://127.0.0.1:8333/ || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 12
@@ -64,6 +76,9 @@ jobs:
           MCP_S3_ENDPOINT: http://127.0.0.1:8333
           MCP_S3_ACCESS_KEY: mcpaccess
           MCP_S3_SECRET_KEY: mcpsecretmcpsecret
+          MCP_TEST_REDIS_HOST: 127.0.0.1
+          MCP_TEST_REDIS_PORT: 6379
+          MCP_TEST_REDIS_DB: 15
         run: mvn -B -ntp verify
 
       - name: Upload test reports

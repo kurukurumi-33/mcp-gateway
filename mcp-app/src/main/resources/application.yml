@@ -1,6 +1,18 @@
 server:
   port: 8931
 
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DB:10}
+      # Without these, actuator's Redis health check waits on an unreachable host for over a minute,
+      # which is long enough for a load balancer to take the instance out of rotation.
+      timeout: ${REDIS_TIMEOUT:500ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:500ms}
+
 mcp:
   gateway:
     # Must stay the same across restarts, or in-flight multi-round calls become unresumable.
@@ -10,6 +22,27 @@ mcp:
     server-version: 0.1.0
     cache-ttl-ms: 60000
     streaming-enabled: true
+
+    # Each backend namespace gets its own slot pool, so one slow backend cannot starve the others.
+    # 0 for max-concurrent disables the bulkhead; 0 for the queue wait sheds callers immediately.
+    max-concurrent-calls-per-backend: 16
+    max-queued-calls-per-backend: 32
+    admission-queue-wait-ms: 0
+    # One adapter call may not exceed this. 0 disables the deadline.
+    call-timeout-ms: 30000
+
+    # Shared token bucket, one per backend namespace. Requires a Redis client on the classpath
+    # (spring-boot-starter-data-redis). capacity is the burst, refill-per-second the sustained rate.
+    rate-limit:
+      enabled: ${MCP_RATE_LIMIT_ENABLED:false}
+      capacity: ${MCP_RATE_LIMIT_CAPACITY:100}
+      refill-per-second: ${MCP_RATE_LIMIT_REFILL:50}
+      key-prefix: "mcp:gateway:rate:"
+      # When Redis is down: true lets calls through, false rejects them with a 1s retry hint.
+      fail-open: true
+      # Upper bound for one limiter check, so an outage cannot stall every call on the client's
+      # own (usually 60 s) Redis command timeout.
+      timeout-ms: 100
 
     # Leave endpoint empty to run with the in-memory demo adapter instead.
     # Works with any S3 implementation: SeaweedFS, MinIO, Ceph, OSS, AWS.
@@ -27,7 +60,28 @@ mcp:
       max-rows: 200
       timeout-seconds: 5
 
+    # Spark runs as a subprocess, never inside the gateway JVM. Off by default because it needs a
+    # local Spark installation, and every call pays a JVM start.
+    spark:
+      enabled: ${MCP_SPARK_ENABLED:false}
+      submit: ${MCP_SPARK_SUBMIT:}
+      master: ${MCP_SPARK_MASTER:local[2]}
+      python: ${MCP_SPARK_PYTHON:}
+      spark-home: ${MCP_SPARK_HOME:}
+      # Windows only: Spark refuses to start without HADOOP_HOME and its bin on PATH.
+      hadoop-home: ${MCP_SPARK_HADOOP_HOME:}
+      max-rows: 50
+      # The driver's own limit. The gateway's call-timeout-ms still applies on top.
+      timeout-seconds: 60
+      # One driver at a time by default; the gateway bulkhead limits callers, this protects the host.
+      max-parallel-jobs: 1
+
 management:
+  health:
+    redis:
+      # With fail-open, a DOWN Redis would mark the whole instance DOWN and a load balancer would
+      # drain it — the opposite of the failure policy. Alert on mcp.gateway.rate_limit.errors.
+      enabled: ${MCP_REDIS_HEALTH_ENABLED:false}
   endpoints:
     web:
       exposure:

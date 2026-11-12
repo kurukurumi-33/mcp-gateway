@@ -22,6 +22,12 @@ public final class McpProtocol {
     /** Required when the method addresses a named entity; must mirror {@code params.name}/{@code params.uri}. */
     public static final String HEADER_NAME = "Mcp-Name";
 
+    /**
+     * Prefix of the optional mirror headers declared by a tool's {@code x-mcp-header} schema
+     * annotation: {@code "x-mcp-header": "region"} puts the argument in {@code Mcp-Param-Region}.
+     */
+    public static final String HEADER_PARAM_PREFIX = "Mcp-Param-";
+
     /** Key prefix for per-request context, replaced the removed {@code initialize} handshake. */
     public static final String META_PREFIX = "io.modelcontextprotocol/";
 
@@ -60,4 +66,8 @@ public final class McpProtocol {
     public static final int MISSING_REQUIRED_CLIENT_CAPABILITY = -32021;
     /** The requested (or absent) protocol revision is not supported. */
     public static final int UNSUPPORTED_PROTOCOL_VERSION = -32022;
+    /** The gateway shed the call because the backend is at its concurrency limit. */
+    public static final int SERVER_BUSY = -32000;
+    /** The backend did not finish within the gateway's per-call deadline. */
+    public static final int BACKEND_TIMEOUT = -32001;
 }

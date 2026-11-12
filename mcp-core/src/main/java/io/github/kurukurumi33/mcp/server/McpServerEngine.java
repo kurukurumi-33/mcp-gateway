@@ -15,6 +15,7 @@ import io.github.kurukurumi33.mcp.spi.HealthStatus;
 import io.github.kurukurumi33.mcp.spi.InputRequest;
 import io.github.kurukurumi33.mcp.spi.InputResponse;
 import io.github.kurukurumi33.mcp.spi.PromptArgument;
+import io.github.kurukurumi33.mcp.spi.PromptContext;
 import io.github.kurukurumi33.mcp.spi.PromptDefinition;
 import io.github.kurukurumi33.mcp.spi.PromptResult;
 import io.github.kurukurumi33.mcp.spi.RequestContext;
@@ -27,12 +28,14 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * The stateless protocol engine: validates a request, routes it, and shapes the reply.
@@ -51,6 +54,10 @@ public final class McpServerEngine {
     private static final String META_AVAILABLE = "io.github.kurukurumi33.mcp/available";
     private static final String META_BACKEND = "io.github.kurukurumi33.mcp/backend";
 
+    private static final String BASE64_WRAPPER_PREFIX = "=?base64?";
+    private static final String BASE64_WRAPPER_SUFFIX = "?=";
+    private static final Pattern BASE64_ALPHABET = Pattern.compile("[A-Za-z0-9+/]*={0,2}");
+
     /** Methods whose {@code Mcp-Name} header is mandatory and must match the body. */
     private static final Set<String> NAMED_METHODS =
             Set.of(McpProtocol.METHOD_TOOLS_CALL, McpProtocol.METHOD_PROMPTS_GET,
@@ -60,6 +67,7 @@ public final class McpServerEngine {
     private final RequestStateCodec stateCodec;
     private final ServerInfo serverInfo;
     private final long cacheTtlMs;
+    private final AdmissionControl admissionControl;
 
     public McpServerEngine(GatewayRegistry registry, RequestStateCodec stateCodec, ServerInfo serverInfo) {
         this(registry, stateCodec, serverInfo, 60_000L);
@@ -67,10 +75,21 @@ public final class McpServerEngine {
 
     public McpServerEngine(GatewayRegistry registry, RequestStateCodec stateCodec,
                            ServerInfo serverInfo, long cacheTtlMs) {
+        this(registry, stateCodec, serverInfo, cacheTtlMs, AdmissionControl.unlimited());
+    }
+
+    /**
+     * @param admissionControl per-backend bulkheads and the call deadline; pass
+     *                         {@link AdmissionControl#unlimited()} to run adapter calls inline
+     */
+    public McpServerEngine(GatewayRegistry registry, RequestStateCodec stateCodec,
+                           ServerInfo serverInfo, long cacheTtlMs,
+                           AdmissionControl admissionControl) {
         this.registry = registry;
         this.stateCodec = stateCodec;
         this.serverInfo = serverInfo;
         this.cacheTtlMs = cacheTtlMs;
+        this.admissionControl = admissionControl;
     }
 
     /**
@@ -95,7 +114,8 @@ public final class McpServerEngine {
             return dispatch(request, liveEmitter);
         } catch (McpException e) {
             return EngineResult.json(
-                    errorMessage(request, e.code(), e.getMessage(), e.data()), e.httpStatus());
+                    errorMessage(request, e.code(), e.getMessage(), e.data()),
+                    e.httpStatus(), e.headers());
         } catch (RuntimeException e) {
             return EngineResult.json(
                     errorMessage(request, McpProtocol.INTERNAL_ERROR, "Internal error: " + e),
@@ -231,6 +251,64 @@ public final class McpServerEngine {
         }
     }
 
+    /**
+     * Checks the optional parameter mirrors a tool declares through {@code "x-mcp-header"}.
+     *
+     * <p>An argument marked that way is repeated in an HTTP header so an intermediary can act on it
+     * without parsing the body. The body is still what the tool runs on, so a disagreement means the
+     * request would be routed and executed as two different things — the same defect {@link
+     * #validateNameHeader} guards, and the same answer.
+     *
+     * <p>Values wrapped as {@code =?base64?...?=} are Base64; anything else is literal. The encoding
+     * exists because header values cannot carry arbitrary bytes, not as a security boundary.
+     */
+    private void validateParameterHeaders(McpRequest request, RegisteredTool tool, JsonNode arguments) {
+        JsonNode properties = Json.orNull(tool.definition().inputSchema(), "properties");
+        if (properties == null || !properties.isObject() || arguments == null || !arguments.isObject()) {
+            return;
+        }
+        for (Map.Entry<String, JsonNode> property : properties.properties()) {
+            JsonNode marker = Json.orNull(property.getValue(), "x-mcp-header");
+            if (marker == null || !marker.isTextual() || marker.asString().isBlank()) {
+                continue;
+            }
+            JsonNode bodyValue = Json.orNull(arguments, property.getKey());
+            if (bodyValue == null || !bodyValue.isTextual()) {
+                // Nothing in the body to mirror, so nothing the header could contradict.
+                continue;
+            }
+            String headerName = McpProtocol.HEADER_PARAM_PREFIX + marker.asString();
+            String headerValue = request.header(headerName);
+            if (headerValue == null) {
+                throw McpException.headerMismatch(
+                        "Header '" + headerName + "' is required when the body carries '" + property.getKey() + "'");
+            }
+            String decoded = decodeParameterHeader(headerName, headerValue);
+            if (!decoded.equals(bodyValue.asString())) {
+                throw McpException.headerMismatch(
+                        "Header '" + headerName + "' does not match argument '" + property.getKey() + "'");
+            }
+        }
+    }
+
+    private static String decodeParameterHeader(String headerName, String value) {
+        boolean wrapped = value.startsWith(BASE64_WRAPPER_PREFIX) && value.endsWith(BASE64_WRAPPER_SUFFIX);
+        if (!wrapped) {
+            return value;
+        }
+        String encoded = value.substring(BASE64_WRAPPER_PREFIX.length(),
+                value.length() - BASE64_WRAPPER_SUFFIX.length());
+        // Checked explicitly: java.util.Base64 accepts unpadded input, while the extension does not.
+        if (encoded.length() % 4 != 0 || !BASE64_ALPHABET.matcher(encoded).matches()) {
+            throw McpException.headerMismatch("Header '" + headerName + "' is not valid Base64");
+        }
+        try {
+            return new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            throw McpException.headerMismatch("Header '" + headerName + "' is not valid Base64");
+        }
+    }
+
     // ------------------------------------------------------------------ methods
 
     private JsonNode discover(McpRequest request) {
@@ -309,6 +387,9 @@ public final class McpServerEngine {
         RegisteredTool tool = registry.findTool(qualifiedName)
                 .orElseThrow(() -> McpException.invalidParams("Unknown tool '" + qualifiedName + "'"));
 
+        JsonNode arguments = Json.orNull(params, "arguments");
+        validateParameterHeaders(request, tool, arguments);
+
         HealthStatus health = tool.adapter().health();
         if (!health.isCallable()) {
             return EngineResult.json(envelope(request, failedResult(
@@ -323,7 +404,7 @@ public final class McpServerEngine {
 
         RequestContext context = new RequestContext(
                 qualifiedName,
-                Json.orNull(params, "arguments"),
+                arguments,
                 inputResponses,
                 continuationState,
                 Json.orNull(Json.orNull(params, "_meta"), McpProtocol.META_CLIENT_CAPABILITIES),
@@ -331,7 +412,10 @@ public final class McpServerEngine {
                 firstText(Json.orNull(params, "_meta"), McpProtocol.META_LOG_LEVEL),
                 emitter);
 
-        ToolResult result = tool.adapter().execute(tool.definition().name(), context);
+        ToolResult result = admissionControl.call(
+                tool.adapter().namespace(),
+                tool.definition().name(),
+                () -> tool.adapter().execute(tool.definition().name(), context));
         JsonNode response = envelope(request, renderResult(result));
 
         //决定返回JSON流还是SSE流
@@ -428,7 +512,10 @@ public final class McpServerEngine {
                     "Backend '" + adapter.namespace() + "' is unavailable: " + health.detail());
         }
 
-        ResourceContent content = adapter.readResource(target.uri()).orElseThrow(() -> resourceNotFound(uri));
+        ResourceContent content = admissionControl.call(
+                        adapter.namespace(), target.uri(),
+                        () -> adapter.readResource(target.uri()))
+                .orElseThrow(() -> resourceNotFound(uri));
 
         ObjectNode entry = Json.obj();
         entry.put("uri", uri);
@@ -516,20 +603,19 @@ public final class McpServerEngine {
         JsonNode supplied = arguments == null ? Json.obj() : arguments;
         validatePromptArguments(prompt.definition(), qualifiedName, supplied);
 
-        PromptResult rendered = prompt.adapter()
-                .getPrompt(prompt.definition().name(), supplied)
+        PromptContext context = new PromptContext(
+                prompt.definition().name(),
+                supplied,
+                parseInputResponses(params),
+                decodeContinuation(params));
+
+        PromptResult rendered = admissionControl.call(
+                        prompt.adapter().namespace(),
+                        prompt.definition().name(),
+                        () -> prompt.adapter().getPrompt(prompt.definition().name(), context))
                 .orElseThrow(() -> promptNotFound(qualifiedName));
 
-        ObjectNode result = Json.obj();
-        result.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
-        if (rendered.description() != null) {
-            result.put("description", rendered.description());
-        }
-        ArrayNode messages = Json.arr();
-        rendered.messages().forEach(messages::add);
-        result.set("messages", messages);
-        result.set("_meta", serverMeta());
-        return envelope(request, result);
+        return envelope(request, renderPromptResult(rendered));
     }
 
     private static McpException promptNotFound(String name) {
@@ -564,20 +650,11 @@ public final class McpServerEngine {
     // ------------------------------------------------------------------ result shaping
 
     private ObjectNode renderResult(ToolResult result) {
-        ObjectNode node = Json.obj();
         if (result.inputRequired()) {
-            node.put("resultType", McpProtocol.RESULT_TYPE_INPUT_REQUIRED);
-            ObjectNode requests = Json.obj();
-            result.inputRequests().forEach((id, inputRequest) ->
-                    requests.set(id, renderInputRequest(inputRequest)));
-            node.set("inputRequests", requests);
-            // The handler's private state is signed here, not handed over raw, so a client cannot
-            // rewrite the operation it is resuming.
-            node.put("requestState", stateCodec.encode(result.continuationState() == null
-                    ? Json.obj() : result.continuationState()));
-            return node;
+            return inputRequiredResult(result.inputRequests(), result.continuationState());
         }
 
+        ObjectNode node = Json.obj();
         node.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
         ArrayNode content = Json.arr();
         result.content().forEach(content::add);
@@ -589,6 +666,40 @@ public final class McpServerEngine {
             node.put("isError", true);
         }
         node.set("_meta", serverMeta());
+        return node;
+    }
+
+    private ObjectNode renderPromptResult(PromptResult result) {
+        if (result.inputRequired()) {
+            return inputRequiredResult(result.inputRequests(), result.continuationState());
+        }
+
+        ObjectNode node = Json.obj();
+        node.put("resultType", McpProtocol.RESULT_TYPE_COMPLETE);
+        if (result.description() != null) {
+            node.put("description", result.description());
+        }
+        ArrayNode messages = Json.arr();
+        result.messages().forEach(messages::add);
+        node.set("messages", messages);
+        node.set("_meta", serverMeta());
+        return node;
+    }
+
+    /**
+     * The shape MRTR shares across methods: pending requests plus the state that links the rounds.
+     *
+     * <p>The handler's private state is signed here, not handed over raw, so a client cannot rewrite
+     * the operation it is resuming.
+     */
+    private ObjectNode inputRequiredResult(Map<String, InputRequest> inputRequests, JsonNode continuationState) {
+        ObjectNode node = Json.obj();
+        node.put("resultType", McpProtocol.RESULT_TYPE_INPUT_REQUIRED);
+        ObjectNode requests = Json.obj();
+        inputRequests.forEach((id, inputRequest) -> requests.set(id, renderInputRequest(inputRequest)));
+        node.set("inputRequests", requests);
+        node.put("requestState", stateCodec.encode(
+                continuationState == null ? Json.obj() : continuationState));
         return node;
     }
 

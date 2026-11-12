@@ -2,7 +2,6 @@ package io.github.kurukurumi33.mcp.spring;
 
 import io.github.kurukurumi33.mcp.protocol.Json;
 import io.github.kurukurumi33.mcp.protocol.McpException;
-import io.github.kurukurumi33.mcp.protocol.McpProtocol;
 import io.github.kurukurumi33.mcp.protocol.McpRequest;
 import io.github.kurukurumi33.mcp.server.EngineResult;
 import io.github.kurukurumi33.mcp.server.McpServerEngine;
@@ -19,6 +18,9 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * The single HTTP entry point: one POST, one JSON-RPC message in, one message (or one stream) out.
@@ -49,11 +51,7 @@ public class McpController {
 
         McpRequest mcpRequest;
         try {
-            mcpRequest = new McpRequest(
-                    request.getHeader(McpProtocol.HEADER_PROTOCOL_VERSION),
-                    request.getHeader(McpProtocol.HEADER_METHOD),
-                    request.getHeader(McpProtocol.HEADER_NAME),
-                    Json.parse(body == null ? "" : body));
+            mcpRequest = new McpRequest(headerMap(request), Json.parse(body == null ? "" : body));
         } catch (McpException e) {
             // The body could not be parsed, so there is no id to echo back.
             writeJson(response, e.httpStatus(), parseError(e));
@@ -64,6 +62,11 @@ public class McpController {
         CommittingEmitter emitter = wantsStream ? new CommittingEmitter(response) : null;
 
         EngineResult result = engine.handle(mcpRequest, emitter);
+
+        if (!result.headers().isEmpty() && (emitter == null || !emitter.isCommitted())) {
+            // Retry-After and friends only make sense before anything has been written.
+            result.headers().forEach(response::setHeader);
+        }
 
         if (emitter != null && emitter.isCommitted()) {
             // Already streaming: the terminal message can only go out on the same stream.
@@ -83,6 +86,14 @@ public class McpController {
     private static boolean acceptsEventStream(HttpServletRequest request) {
         String accept = request.getHeader("Accept");
         return accept != null && accept.contains("text/event-stream");
+    }
+
+    private static Map<String, String> headerMap(HttpServletRequest request) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        for (String name : Collections.list(request.getHeaderNames())) {
+            headers.put(name, request.getHeader(name));
+        }
+        return headers;
     }
 
     private static void writeJson(HttpServletResponse response, int status, JsonNode message)
