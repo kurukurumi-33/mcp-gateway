@@ -42,8 +42,9 @@ class SparkQueryAdapterTest {
         Path submit = fakeSparkSubmit("""
                 echo 26/11/11 INFO SparkContext: running
                 echo %s
-                echo {"columns":["n","s"],"rows":[[1,"x"],[2,"y"]],"truncated":false}
-                """.formatted(SparkQueryAdapter.RESULT_MARKER));
+                %s
+                """.formatted(SparkQueryAdapter.RESULT_MARKER,
+                echoJson("{\"columns\":[\"n\",\"s\"],\"rows\":[[1,\"x\"],[2,\"y\"]],\"truncated\":false}")));
         SparkQueryAdapter adapter = adapter(submit);
 
         ToolResult result = adapter.execute("run_sql", context("SELECT 1 AS n, 'x' AS s"));
@@ -60,8 +61,9 @@ class SparkQueryAdapterTest {
     void truncationReachesTheModel() throws IOException {
         Path submit = fakeSparkSubmit("""
                 echo %s
-                echo {"columns":["n"],"rows":[[1]],"truncated":true}
-                """.formatted(SparkQueryAdapter.RESULT_MARKER));
+                %s
+                """.formatted(SparkQueryAdapter.RESULT_MARKER,
+                echoJson("{\"columns\":[\"n\"],\"rows\":[[1]],\"truncated\":true}")));
         SparkQueryAdapter adapter = adapter(submit);
 
         ToolResult result = adapter.execute("run_sql", context("SELECT * FROM big"));
@@ -122,7 +124,7 @@ class SparkQueryAdapterTest {
                 [ -f "$SPY" ] || exit 3
                 [ -f "$SQY" ] || exit 3
                 echo @MARKER@
-                echo {"columns":["script","sql"],"rows":[["$SPY","$SQY"]],"truncated":false}
+                echo "{\\"columns\\":[\\"script\\",\\"sql\\"],\\"rows\\":[[\\"$SPY\\",\\"$SQY\\"]],\\"truncated\\":false}"
                 """;
         SparkQueryAdapter adapter = adapter(fakeSparkSubmit(body.replace("@MARKER@",
                 SparkQueryAdapter.RESULT_MARKER)));
@@ -168,6 +170,15 @@ class SparkQueryAdapterTest {
 
     private static String sleepCommand() {
         return windows() ? "ping -n 8 127.0.0.1 >nul\n" : "sleep 7\n";
+    }
+
+    /**
+     * POSIX shells strip the quotes inside an unquoted argument, so {@code echo {"a":"b"}} arrives
+     * as {@code {a:b}} and the adapter cannot parse it. Single-quoting keeps the JSON intact;
+     * cmd.exe has no such problem.
+     */
+    private static String echoJson(String json) {
+        return windows() ? "echo " + json : "printf '%s\\n' '" + json + "'";
     }
 
     /**
