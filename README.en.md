@@ -14,26 +14,7 @@ One endpoint in front of many backends. Each backend is a small `BackendAdapter`
 gateway owns the protocol, the tool catalog, health reporting and multi-round calls, so adding a
 backend never means touching the protocol engine.
 
-**What you can verify**
-
-- **Protocol conformance**: 19 draft server scenarios, 96 checks, all passing in the official MCP
-  conformance suite.
-- **Tests and coverage**: 98 JUnit tests pass in CI, with 86% line coverage in the core module.
-- **Multiple backends**: S3, DuckDB and Spark sit behind the same SPI; a new backend changes no
-  protocol code.
-- **Stateless failover**: in the two-instance demo, the node that started a multi-round call is
-  stopped and the `requestState` still completes the call on the other node.
-
-Run it first:
-
-```bash
-docker compose up --build -d
-curl -s http://127.0.0.1:8931/actuator/health
-```
-
-Full steps are in [Docker](#docker).
-
-## Why this exists
+## Overview
 
 The official MCP Java SDK does not speak this revision yet. As of **2026-10**, both `2.1.0` (stable)
 and `2.2.0-M1` (milestone) top out at protocol `2025-11-25`:
@@ -53,7 +34,37 @@ server that speaks `2026-07-28` has to carry its own protocol layer.
 Separately, existing "MCP gateway" projects aggregate *other MCP servers*. This one goes the other
 way: it adapts plain backends directly, with no MCP server in between.
 
-## What 2026-07-28 changes (and what is implemented here)
+## Key features
+
+- **Stateless protocol implementation**: no `initialize` handshake and no `Mcp-Session-Id`; the
+  version and client capabilities travel in each request's `_meta`, so any instance can serve any
+  request.
+- **Multiple backend types behind one SPI**: S3, DuckDB and Spark share the same `BackendAdapter`
+  interface, and adding a backend changes nothing in the protocol engine.
+- **Multi-round requests and streaming notifications**: MRTR with `input_required` /
+  `inputResponses`, signed and expiring `requestState`, and request-scoped SSE progress.
+- **Admission control and shared rate limiting**: per-namespace bulkheads, call deadlines, and a
+  Redis Lua token bucket shared across instances.
+- **Verifiable results**: 96/96 checks in the official MCP conformance suite (draft scenarios), 98
+  JUnit tests passing in CI, and 86% line coverage in the core module.
+
+## Architecture
+
+```
+client ── HTTP / SSE ──> Spring endpoint ──> McpServerEngine ──> BackendRegistry ──> BackendAdapter
+                                                 │
+                                                 ├── RequestStateCodec (signing, expiry)
+                                                 └── admission control (bulkhead, deadline, Redis limiter)
+```
+
+- **`mcp-core`**: protocol constants, the JSON-RPC envelope, the request engine, the
+  `BackendAdapter` SPI, namespaced catalogs and `mcp://` routing, with no Spring dependency.
+- **`mcp-backends`**: the S3, DuckDB and Spark adapters, plus the shared read-only SQL guard.
+- **`mcp-spring-boot-starter`**: autoconfiguration, the HTTP endpoint and the actuator health
+  contributor.
+- **`mcp-app`**: a runnable sample that combines the starter with the adapters.
+
+## Protocol coverage
 
 | Change | Status |
 |---|---|
@@ -109,7 +120,7 @@ SSE; without it you get a single JSON body.
 
 ## Docker
 
-The whole stack — gateway, object storage, bucket — comes up with one command:
+The whole stack (gateway, object storage and bucket) comes up with one command:
 
 ```bash
 docker compose up --build -d
@@ -141,10 +152,10 @@ docker compose down          # keep the volume
 docker compose down -v       # drop the objects too
 ```
 
-## Multi-instance
+## Multi-instance failover
 
 The protocol's claim is that any node can serve any request. `docker/multi-instance-demo.sh`
-turns that from a design note into an experiment:
+turns that design note into a reproducible experiment:
 
 ```bash
 bash docker/multi-instance-demo.sh
@@ -201,7 +212,7 @@ mcp:
     call-timeout-ms: 30000                 # 0 disables the deadline
 ```
 
-Two limits are worth stating plainly:
+Two limits need to be stated:
 
 - **Cancellation is cooperative.** `Thread.interrupt` only wakes a thread blocked in
   `sleep`/`wait`/`park` or an `InterruptibleChannel`; a thread blocked in a socket read or inside a
@@ -305,14 +316,14 @@ Three runs make the admission-control modes comparable:
 | bulkhead | default `max-concurrent-calls-per-backend=16`, rate limit off |
 | shared bucket | rate limit on, two instances, one `--url` each |
 
-Read `ok ... goodput` first: in the bulkhead run it plateaus near `slots / call duration` and does
+Start with `ok ... goodput`: in the bulkhead run it plateaus near `slots / call duration` and does
 not grow with `--concurrency`. The rest of the attempts land in `429 concurrency`. In the shared
 bucket run the aggregate goodput stays near the configured `capacity` even though the load is split
 across instances, which is the property a per-process semaphore cannot provide. Latency is reported
 separately for completed calls and for 429s, because mixing them makes a workload that is mostly
 rejections look fast.
 
-## Testing
+## Tests and coverage
 
 `mvn verify` runs 98 tests and writes a JaCoCo report per module under `target/site/jacoco/`. CI runs
 the same command on every push against JDK 21, which is the release target rather than the local JDK,
@@ -324,7 +335,7 @@ with a Redis service so the shared-limiter tests run there too.
 | `mcp-backends` | 66% (79% with SeaweedFS) | S3 adapter (unit, plus integration against SeaweedFS when `MCP_S3_ENDPOINT` is set — the three skipped here), DuckDB guard, truncation, catalog and error shaping |
 | `mcp-spring-boot-starter` | 75% | the HTTP endpoint over a real port: status codes, SSE switch, 429 with `Retry-After`, the Redis limiter's scripts and failure policies, actuator aggregation |
 
-Two exclusions are deliberate. `mcp-core` skips `devtools/` and `conformance/` in the report: the dev
+Two coverage exclusions are deliberate. `mcp-core` skips `devtools/` and `conformance/` in the report: the dev
 server is a harness no test drives, and the conformance fixtures exist to be called over the wire by
 the official suite, so counting them would measure code nothing here executes.
 
@@ -339,7 +350,7 @@ disagrees with the JSON-RPC body, a `Content-Type` that should have switched to 
 and whether SSE messages actually arrive before the response completes. Each of those is a fact about
 the wire, not about a return value.
 
-## Conformance
+## Official conformance suite
 
 The official conformance suite plays the client, drives the server, and checks every response against
 the specification. This revision is still counted as the draft there, so the run needs the alpha CLI
@@ -364,7 +375,7 @@ Current result: **96 passed, 0 failed** across the draft server scenarios.
 | `sep-2164-resource-not-found` | 4 / 4 |
 | `caching` | 8 / 8 |
 
-Two pieces of the revision are easy to miss because they only show up on the HTTP layer:
+Two parts of the revision are easy to miss because they only show up on the HTTP layer:
 
 - **Parameter mirrors (`x-mcp-header`).** A tool can annotate one string argument with
   `"x-mcp-header": "region"`, and clients then repeat that argument in `Mcp-Param-region`. The engine
@@ -541,7 +552,7 @@ curl -s -X POST http://127.0.0.1:8931/mcp \
 
 The reply is `5 row(s), 2 column(s)` with the rows in `structuredContent`.
 
-### One Windows trap worth knowing
+### Windows path encoding
 
 Spark's launcher re-encodes its command-line arguments through the console code page, so an absolute
 script path containing non-ASCII characters reaches the JVM as `?` and the launch dies in
@@ -631,7 +642,7 @@ Two rules keep the catalog trustworthy:
 methods, so a backend with no resources or prompts never mentions them. Overriding one is enough;
 nothing else in the engine or registry changes.
 
-## Layout
+## Project layout
 
 ```
 mcp-gateway/
@@ -657,7 +668,7 @@ mcp-gateway/
 `mcp-core` has no Spring dependency, so the engine and SPI work in any Java runtime. The starter is one
 thin binding; adapters behind the same SPI need nothing else.
 
-## Notes on two deliberate choices
+## Design trade-offs
 
 **`requestState` is signed and expires.** Removing sessions left one place for the server to remember
 a call in flight: an opaque token the client replays. Anything holding that token can edit it. Since
@@ -679,10 +690,37 @@ final result is a single message, and interim feedback travels as `notifications
 the engine puts those messages on the request's own response stream. This also keeps one code path
 instead of two that drift apart.
 
+## Known limitations
+
+- **Incomplete protocol coverage**: `subscriptions/listen`, the tasks extension, OAuth and the
+  stdio transport are not implemented.
+- **The protocol layer is maintained here**: the official Java SDK currently stops at
+  `2025-11-25`; supporting `2026-07-28` means keeping this implementation in step with the revision.
+- **`requestState` bounds replay rather than preventing it**: tokens expire after 15 minutes by
+  default; strict single use would need an additional nonce store.
+- **Bulkheads are per process**: with multiple instances the effective concurrency limit scales with
+  the instance count; the shared limiter constrains request rate, not in-flight concurrency.
+- **Cancellation is cooperative**: a deadline stops the wait, but work blocked in a socket read or a
+  native JDBC call keeps running and holds its slot until it finishes.
+- **Adapters must be stateless**: failover only holds for shared backends; a stream whose serving
+  node exits cannot be resumed.
+- **Spark has high startup cost**: every call starts a separate JVM, and a one-row query measured
+  about 9 seconds end to end locally, so it suits low-frequency queries.
+- **The dev server is not hardened**: the JDK HttpServer transport in `mcp-core` has no TLS,
+  authentication or rate limiting and is only meant for local debugging.
+- **S3 integration tests skip by default**: without SeaweedFS running locally, the three S3
+  integration tests do not execute, and the coverage figure reflects the no-storage environment.
+
 ## Roadmap
 
 - Adapters: HBase behind the same SPI
 - `subscriptions/listen`, tasks extension, OAuth
+
+## Documentation
+
+- [README.md](README.md): Simplified Chinese version
+- [docs/manual-tests.http](docs/manual-tests.http): HTTP-layer behaviour that needs manual
+  confirmation, such as status codes and SSE timing
 
 ## License
 
