@@ -41,9 +41,9 @@ class SparkQueryAdapterTest {
     void parsesTheLineAfterTheMarkerAndIgnoresSparkLogging() throws IOException {
         Path submit = fakeSparkSubmit("""
                 echo 26/11/11 INFO SparkContext: running
-                echo %s
                 %s
-                """.formatted(SparkQueryAdapter.RESULT_MARKER,
+                %s
+                """.formatted(echoMarker(),
                 echoJson("{\"columns\":[\"n\",\"s\"],\"rows\":[[1,\"x\"],[2,\"y\"]],\"truncated\":false}")));
         SparkQueryAdapter adapter = adapter(submit);
 
@@ -60,9 +60,9 @@ class SparkQueryAdapterTest {
     @Test
     void truncationReachesTheModel() throws IOException {
         Path submit = fakeSparkSubmit("""
-                echo %s
                 %s
-                """.formatted(SparkQueryAdapter.RESULT_MARKER,
+                %s
+                """.formatted(echoMarker(),
                 echoJson("{\"columns\":[\"n\"],\"rows\":[[1]],\"truncated\":true}")));
         SparkQueryAdapter adapter = adapter(submit);
 
@@ -123,7 +123,7 @@ class SparkQueryAdapterTest {
                 done
                 [ -f "$SPY" ] || exit 3
                 [ -f "$SQY" ] || exit 3
-                echo @MARKER@
+                echo '@MARKER@'
                 echo "{\\"columns\\":[\\"script\\",\\"sql\\"],\\"rows\\":[[\\"$SPY\\",\\"$SQY\\"]],\\"truncated\\":false}"
                 """;
         SparkQueryAdapter adapter = adapter(fakeSparkSubmit(body.replace("@MARKER@",
@@ -170,6 +170,15 @@ class SparkQueryAdapterTest {
 
     private static String sleepCommand() {
         return windows() ? "ping -n 8 127.0.0.1 >nul\n" : "sleep 7\n";
+    }
+
+    /**
+     * POSIX shells treat a word starting with {@code #} as a comment, so an unquoted marker prints
+     * an empty line. cmd.exe has no such rule and would print the quotes literally.
+     */
+    private static String echoMarker() {
+        return windows() ? "echo " + SparkQueryAdapter.RESULT_MARKER
+                : "echo '" + SparkQueryAdapter.RESULT_MARKER + "'";
     }
 
     /**
