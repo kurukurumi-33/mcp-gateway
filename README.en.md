@@ -3,12 +3,35 @@
 [简体中文](README.md) | English
 
 [![CI](https://github.com/kurukurumi-33/mcp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/kurukurumi-33/mcp-gateway/actions/workflows/ci.yml)
+![Java 21](https://img.shields.io/badge/Java-21-orange)
+![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Conformance 96/96](https://img.shields.io/badge/conformance-96%2F96-brightgreen)
+![License Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)
 
 A multi-backend gateway framework for the **MCP 2026-07-28** stateless protocol, written in Java.
 
 One endpoint in front of many backends. Each backend is a small `BackendAdapter` implementation; the
 gateway owns the protocol, the tool catalog, health reporting and multi-round calls, so adding a
 backend never means touching the protocol engine.
+
+**What you can verify**
+
+- **Protocol conformance**: 19 draft server scenarios, 96 checks, all passing in the official MCP
+  conformance suite.
+- **Tests and coverage**: 98 JUnit tests pass in CI, with 86% line coverage in the core module.
+- **Multiple backends**: S3, DuckDB and Spark sit behind the same SPI; a new backend changes no
+  protocol code.
+- **Stateless failover**: in the two-instance demo, the node that started a multi-round call is
+  stopped and the `requestState` still completes the call on the other node.
+
+Run it first:
+
+```bash
+docker compose up --build -d
+curl -s http://127.0.0.1:8931/actuator/health
+```
+
+Full steps are in [Docker](#docker).
 
 ## Why this exists
 

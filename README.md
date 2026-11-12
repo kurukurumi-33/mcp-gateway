@@ -3,10 +3,30 @@
 [English](README.en.md) | 简体中文
 
 [![CI](https://github.com/kurukurumi-33/mcp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/kurukurumi-33/mcp-gateway/actions/workflows/ci.yml)
+![Java 21](https://img.shields.io/badge/Java-21-orange)
+![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Conformance 96/96](https://img.shields.io/badge/conformance-96%2F96-brightgreen)
+![License Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)
 
 面向 **MCP 2026-07-28** 无状态协议的多后端网关框架，Java 实现。
 
 一个端点位于多个后端之前。每个后端只需实现一个小型 `BackendAdapter`；协议、工具目录、健康上报和多轮调用由网关负责，新增后端不需要改协议引擎。
+
+**可以验证的结果**
+
+- **协议一致性**：官方 MCP 一致性套件 draft 场景 19 个、96 项检查全部通过。
+- **测试与覆盖**：98 个 JUnit 用例在 CI 全量通过，核心模块行覆盖率 86%。
+- **多后端适配**：同一套 SPI 接入 S3、DuckDB、Spark，新增后端不改协议引擎。
+- **无状态故障切换**：双实例演练中停掉发起节点，requestState 仍可在另一节点完成调用。
+
+先跑起来：
+
+```bash
+docker compose up --build -d
+curl -s http://127.0.0.1:8931/actuator/health
+```
+
+完整步骤见 [Docker](#docker)。
 
 ## 为什么需要它
 
