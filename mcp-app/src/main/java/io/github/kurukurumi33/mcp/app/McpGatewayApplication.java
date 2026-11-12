@@ -2,6 +2,7 @@ package io.github.kurukurumi33.mcp.app;
 
 import io.github.kurukurumi33.mcp.backends.duckdb.DuckDBQueryAdapter;
 import io.github.kurukurumi33.mcp.backends.s3.S3StorageAdapter;
+import io.github.kurukurumi33.mcp.backends.spark.SparkQueryAdapter;
 import io.github.kurukurumi33.mcp.conformance.ConformanceAdapter;
 import io.github.kurukurumi33.mcp.demo.ComputeAdapter;
 import io.github.kurukurumi33.mcp.demo.StorageAdapter;
@@ -14,6 +15,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.env.Environment;
 
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.List;
 
 /**
@@ -85,6 +87,36 @@ public class McpGatewayApplication {
                 environment.getProperty("mcp.gateway.duckdb.max-rows", Integer.class, 200),
                 environment.getProperty("mcp.gateway.duckdb.timeout-seconds", Integer.class, 5),
                 DEMO_SEED);
+    }
+
+    /**
+     * Apache Spark over {@code spark-submit}. Off by default: it needs a local Spark installation,
+     * and every call starts a JVM, so the sample stays fast unless you opt in.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "mcp.gateway.spark.enabled", havingValue = "true")
+    BackendAdapter sparkAdapter(Environment environment) {
+        return new SparkQueryAdapter("spark", new SparkQueryAdapter.Settings(
+                Path.of(required(environment, "mcp.gateway.spark.submit")),
+                environment.getProperty("mcp.gateway.spark.master", "local[2]"),
+                pathOrNull(environment.getProperty("mcp.gateway.spark.python")),
+                pathOrNull(environment.getProperty("mcp.gateway.spark.spark-home")),
+                pathOrNull(environment.getProperty("mcp.gateway.spark.hadoop-home")),
+                environment.getProperty("mcp.gateway.spark.max-rows", Integer.class, 50),
+                environment.getProperty("mcp.gateway.spark.timeout-seconds", Integer.class, 60),
+                environment.getProperty("mcp.gateway.spark.max-parallel-jobs", Integer.class, 1)));
+    }
+
+    private static String required(Environment environment, String key) {
+        String value = environment.getProperty(key);
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException(key + " is required when mcp.gateway.spark.enabled=true");
+        }
+        return value;
+    }
+
+    private static Path pathOrNull(String value) {
+        return value == null || value.isBlank() ? null : Path.of(value);
     }
 
     /**
